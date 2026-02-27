@@ -13,6 +13,21 @@ android/**/captures/
 *.apk
 *.aab
 
+# ===== Frontend =====
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.vite/
+frontend/coverage/
+frontend/.env
+frontend/.env.*
+frontend/*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+vite.config.*.timestamp-*
+
 # ===== IDE / OS =====
 .idea/
 .vscode/

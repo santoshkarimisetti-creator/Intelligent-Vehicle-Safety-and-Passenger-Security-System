@@ -4,6 +4,7 @@ from pymongo import MongoClient
 from bson.objectid import ObjectId
 from datetime import datetime
 import uuid
+from math import radians, sin, cos, sqrt, atan2
 
 app = Flask(__name__)
 CORS(app)
@@ -12,59 +13,27 @@ CORS(app)
 MONGO_URI = "mongodb://localhost:27017/"
 client = MongoClient(MONGO_URI)
 db = client["ivs_db"]
-collection = db["items"]
 trips_collection = db["trips"]
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Calculate distance in kilometers between two lat/lon points using Haversine formula."""
+    R = 6371  # Earth's radius in km
+    
+    lat1_rad = radians(lat1)
+    lat2_rad = radians(lat2)
+    delta_lat = radians(lat2 - lat1)
+    delta_lon = radians(lon2 - lon1)
+    
+    a = sin(delta_lat / 2) ** 2 + cos(lat1_rad) * cos(lat2_rad) * sin(delta_lon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = R * c
+    return distance
 
 
 @app.get("/")
 def health_check():
     return jsonify({"status": "ok"})
-
-
-@app.post("/items")
-def create_item():
-    """Insert a test item into MongoDB"""
-    try:
-        item = {
-            "name": request.json.get("name", "Test Item"),
-            "description": request.json.get("description", "Test Description"),
-            "created_at": datetime.utcnow()
-        }
-        result = collection.insert_one(item)
-        return jsonify({
-            "message": "Item created successfully",
-            "id": str(result.inserted_id)
-        }), 201
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.get("/items")
-def fetch_items():
-    """Fetch all items from MongoDB"""
-    try:
-        items = list(collection.find())
-        # Convert ObjectId to string for JSON serialization
-        for item in items:
-            item["_id"] = str(item["_id"])
-            item["created_at"] = item["created_at"].isoformat() if isinstance(item["created_at"], datetime) else item["created_at"]
-        return jsonify({"items": items}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.get("/items/<item_id>")
-def fetch_item(item_id):
-    """Fetch a single item by ID"""
-    try:
-        item = collection.find_one({"_id": ObjectId(item_id)})
-        if not item:
-            return jsonify({"error": "Item not found"}), 404
-        item["_id"] = str(item["_id"])
-        item["created_at"] = item["created_at"].isoformat() if isinstance(item["created_at"], datetime) else item["created_at"]
-        return jsonify(item), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 
 
 @app.post("/trips")
@@ -297,6 +266,45 @@ def end_trip(trip_id):
             "status": "COMPLETED",
             "sensor_records_collected": sensor_count,
             "end_time": datetime.utcnow().isoformat()
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/trips/<trip_id>/distance")
+def get_trip_distance(trip_id):
+    """Calculate and return total distance traveled for a trip."""
+    try:
+        trip = trips_collection.find_one({"trip_id": trip_id})
+        if not trip:
+            return jsonify({"error": "Trip not found"}), 404
+        
+        path = trip.get("path", [])
+        if len(path) < 2:
+            return jsonify({
+                "trip_id": trip_id,
+                "distance_km": 0.0,
+                "points_count": len(path)
+            }), 200
+        
+        total_distance = 0.0
+        for i in range(1, len(path)):
+            prev = path[i - 1]
+            current = path[i]
+            
+            prev_lat = float(prev.get("lat", 0))
+            prev_lon = float(prev.get("lon", 0))
+            curr_lat = float(current.get("lat", 0))
+            curr_lon = float(current.get("lon", 0))
+            
+            if prev_lat and prev_lon and curr_lat and curr_lon:
+                distance = haversine_distance(prev_lat, prev_lon, curr_lat, curr_lon)
+                total_distance += distance
+        
+        return jsonify({
+            "trip_id": trip_id,
+            "distance_km": round(total_distance, 2),
+            "points_count": len(path)
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

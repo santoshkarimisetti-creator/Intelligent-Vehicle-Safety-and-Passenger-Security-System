@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IVS Architecture Flow</title>
+  <style>
+    :root {
+      --border: 2px solid #000;
+      --box-padding: 10px 14px;
+      --arrow-width: 2px;
+      --arrow-height: 16px;
+      --col-gap: 14px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Times New Roman", Times, serif;
+      color: #000;
+      background: transparent;
+      overflow: hidden;
+    }
+
+    .page {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+    }
+
+    .diagram {
+      width: min(1100px, 100%);
+      max-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 10px;
+    }
+
+    h1 {
+      margin: 0;
+      text-align: center;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.2px;
+    }
+
+    .subhead {
+      text-align: center;
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 200px 1fr 200px;
+      gap: var(--col-gap);
+      align-items: start;
+    }
+
+    .column {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .box {
+      width: 100%;
+      border: var(--border);
+      padding: var(--box-padding);
+      text-align: center;
+      font-size: 12px;
+      line-height: 1.25;
+    }
+
+    .box strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 13px;
+    }
+
+    .arrow {
+      width: var(--arrow-width);
+      height: var(--arrow-height);
+      background: #000;
+      position: relative;
+    }
+
+    .arrow::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      top: -6px;
+      width: 0;
+      height: 0;
+      border-left: 6px solid transparent;
+      border-right: 6px solid transparent;
+      border-bottom: 8px solid #000;
+    }
+
+    .center-flow {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .layer {
+      width: min(500px, 100%);
+      border: var(--border);
+      padding: var(--box-padding);
+      text-align: left;
+      font-size: 12px;
+      line-height: 1.25;
+    }
+
+    .layer-title {
+      font-weight: 700;
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+
+    .layer ul {
+      margin: 0;
+      padding-left: 16px;
+    }
+
+    .layer li {
+      margin: 1px 0;
+    }
+
+    .note {
+      font-size: 11px;
+      text-align: center;
+      margin-top: 6px;
+    }
+
+    .arrow-horizontal {
+      width: 28px;
+      height: var(--arrow-width);
+      background: #000;
+      position: relative;
+      margin: 4px 0;
+    }
+
+    .arrow-horizontal::after {
+      content: "";
+      position: absolute;
+      right: -6px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 0;
+      height: 0;
+      border-top: 6px solid transparent;
+      border-bottom: 6px solid transparent;
+      border-left: 8px solid #000;
+    }
+
+    @media (max-width: 960px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .column {
+        width: 100%;
+      }
+
+      .arrow-horizontal {
+        transform: rotate(90deg);
+        margin: 10px 0;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="diagram" aria-label="IVS Architecture Flow">
+      <header>
+        <h1>System Architecture</h1>
+        <div class="subhead">Sensing (ML) → Reasoning (AI) → Action → Storage → Visualization</div>
+      </header>
+
+      <div class="grid">
+        <!-- Left Column: Input Sources -->
+        <div class="column" aria-label="Input Sources">
+          <div class="box">
+            <strong>Mobile App (Layer A)</strong>
+            Start/End trip<br />
+            GPS tracking<br />
+            Manual SOS
+          </div>
+          <div class="box">
+            <strong>Camera Input</strong>
+            Driver + passenger video stream
+          </div>
+        </div>
+
+        <!-- Center Column: Layer Stack -->
+        <div class="center-flow" aria-label="Layer Stack">
+          <div class="layer">
+            <div class="layer-title">Layer E: Web Dashboard (Visualization)</div>
+            <ul>
+              <li>Live map, route, event timeline</li>
+              <li>Risk status and emergency indicator</li>
+              <li>Read-only observer</li>
+            </ul>
+          </div>
+          <div class="arrow" aria-hidden="true"></div>
+          <div class="layer">
+            <div class="layer-title">Layer D: Backend & Storage (Flask + MongoDB)</div>
+            <ul>
+              <li>REST APIs for trips, GPS, signals, SOS</li>
+              <li>Persist events and risk history</li>
+              <li>Trip lifecycle management</li>
+            </ul>
+          </div>
+          <div class="arrow" aria-hidden="true"></div>
+          <div class="layer">
+            <div class="layer-title">Layer C: AI Decision & Risk Engine</div>
+            <ul>
+              <li>Risk scoring from ML signals</li>
+              <li>Classify risk: Low → Critical</li>
+              <li>Escalate emergency on SOS</li>
+            </ul>
+          </div>
+          <div class="arrow" aria-hidden="true"></div>
+          <div class="layer">
+            <div class="layer-title">Layer B: ML Monitoring (Perception)</div>
+            <ul>
+              <li>Drowsiness and distraction detection</li>
+              <li>Passenger distress signals (support)</li>
+              <li>Emit signals only (no decisions)</li>
+            </ul>
+          </div>
+          <div class="arrow" aria-hidden="true"></div>
+          <div class="layer">
+            <div class="layer-title">Layer A: Mobile App (IoT Device)</div>
+            <ul>
+              <li>GPS stream to backend</li>
+              <li>Manual SOS trigger</li>
+              <li>No ML or risk computation</li>
+            </ul>
+          </div>
+        </div>
+
+        <!-- Right Column: Dual SOS Paths -->
+        <div class="column" aria-label="Dual SOS Paths">
+          <div class="box">
+            <strong>SOS Path 1</strong>
+            ML gesture detection<br />
+            Sustained X-shape<br />
+            SOS event → Backend
+          </div>
+          <div class="arrow-horizontal" aria-hidden="true"></div>
+          <div class="box">
+            <strong>Backend Emergency Logic</strong>
+            Trip = EMERGENCY<br />
+            Log source + alert
+          </div>
+          <div class="arrow-horizontal" aria-hidden="true"></div>
+          <div class="box">
+            <strong>SOS Path 2</strong>
+            Mobile app SOS button<br />
+            SOS event → Backend
+          </div>
+        </div>
+      </div>
+
+      <div class="note">All decisions flow through AI layer. Dashboard is read-only.</div>
+    </section>
+  </main>
+</body>
+</html>
