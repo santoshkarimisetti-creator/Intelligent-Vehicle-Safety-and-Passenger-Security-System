@@ -1,5 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react'
-import { subscribeLive } from '../mockBackend'
+import { subscribeLive } from '../services/liveTelemetry'
 import LiveMap from '../components/LiveMap'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'

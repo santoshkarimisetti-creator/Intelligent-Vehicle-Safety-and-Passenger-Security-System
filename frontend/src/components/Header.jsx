@@ -10,7 +10,6 @@ export default function Header(){
 
   return (
     <header className="app-header">
-      <div className="title">Driver Drowsiness Detection</div>
       <div className="header-right">
         <div className="status-badge">Monitoring: <span className="badge green">ACTIVE</span></div>
         <div className="now">{now.toLocaleString()}</div>

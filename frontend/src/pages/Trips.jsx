@@ -1,9 +1,10 @@
 import React, {useMemo, useState, useEffect} from 'react'
 import { Link } from 'react-router-dom'
-import { getTrips } from '../mockBackend'
+import { getTrips } from '../api/trips'
 
 export default function Trips(){
   const [query, setQuery] = useState('')
+  const [selectedDate, setSelectedDate] = useState('')
   const [trips, setTrips] = useState([])
 
   useEffect(()=>{
@@ -12,20 +13,47 @@ export default function Trips(){
     return ()=> { mounted = false }
   },[])
 
-  const filtered = useMemo(()=> trips.filter(t=> (
-    t.id.toLowerCase().includes(query.toLowerCase()) || t.driver.toLowerCase().includes(query.toLowerCase())
-  )),[trips,query])
+  const getDateKey = (value) => {
+    if(!value) return ''
+
+    const raw = String(value).trim()
+    const datePart = raw.split(',')[0]?.trim() || ''
+
+    const ddmmyyyy = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(datePart)
+    if(ddmmyyyy){
+      const [, dd, mm, yyyy] = ddmmyyyy
+      return `${yyyy}-${mm}-${dd}`
+    }
+
+    const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw)
+    if(iso){
+      const [, yyyy, mm, dd] = iso
+      return `${yyyy}-${mm}-${dd}`
+    }
+
+    return ''
+  }
+
+  const filtered = useMemo(()=> trips.filter(t=> {
+    const matchesQuery = t.id.toLowerCase().includes(query.toLowerCase()) || t.driver.toLowerCase().includes(query.toLowerCase())
+    if(!matchesQuery) return false
+    if(!selectedDate) return true
+    return getDateKey(t.start) === selectedDate
+  }),[trips,query,selectedDate])
 
   return (
     <div className="page trips">
       <div className="list-header">
         <h1>Trips</h1>
-        <input className="search" placeholder="Search by Trip or Driver" value={query} onChange={e=>setQuery(e.target.value)} />
+        <div className="header-filters">
+          <input className="search" placeholder="Search by Trip or Driver" value={query} onChange={e=>setQuery(e.target.value)} />
+          <input type="date" className="search" value={selectedDate} onChange={e=>setSelectedDate(e.target.value)} />
+        </div>
       </div>
       <table className="trips-table">
         <thead>
           <tr>
-            <th>Trip ID</th>
+            <th>S.No</th>
             <th>Driver ID</th>
             <th>Start Time</th>
             <th>End Time</th>
@@ -37,9 +65,9 @@ export default function Trips(){
           </tr>
         </thead>
         <tbody>
-          {filtered.map(t=> (
+          {filtered.map((t, index)=> (
             <tr key={t.id}>
-              <td>{t.id}</td>
+              <td>{index + 1}</td>
               <td>{t.driver}</td>
               <td>{t.start}</td>
               <td>{t.end || '-'}</td>

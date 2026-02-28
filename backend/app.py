@@ -3,6 +3,7 @@ from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import uuid
 from math import radians, sin, cos, sqrt, atan2
 
@@ -14,6 +15,31 @@ MONGO_URI = "mongodb://localhost:27017/"
 client = MongoClient(MONGO_URI)
 db = client["ivs_db"]
 trips_collection = db["trips"]
+
+IST_ZONE = ZoneInfo("Asia/Kolkata")
+
+
+def to_ist_display(value):
+    if value is None:
+        return None
+
+    dt = None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            normalized = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(normalized)
+        except ValueError:
+            return value
+    else:
+        return str(value)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+
+    ist_dt = dt.astimezone(IST_ZONE)
+    return ist_dt.strftime("%d/%m/%Y, %I:%M:%S %p IST")
 
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -29,6 +55,27 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     distance = R * c
     return distance
+
+
+def _to_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def compute_max_speed(trip):
+    max_speed = 0.0
+
+    sensor_data = trip.get("sensor_data", []) or []
+    for point in sensor_data:
+        max_speed = max(max_speed, _to_float(point.get("speed", 0)))
+
+    path = trip.get("path", []) or []
+    for point in path:
+        max_speed = max(max_speed, _to_float(point.get("speed", 0)))
+
+    return round(max_speed, 2)
 
 
 @app.get("/")
@@ -65,7 +112,7 @@ def create_trip():
             "message": "Trip created successfully",
             "trip_id": trip_id,
             "driver_id": driver_id,
-            "start_time": trip["start_time"].isoformat(),
+            "start_time": to_ist_display(trip["start_time"]),
             "status": trip["status"]
         }), 201
     except Exception as e:
@@ -80,7 +127,28 @@ def get_trips():
         # Convert ObjectId and datetime to string for JSON serialization
         for trip in trips:
             trip["_id"] = str(trip["_id"])
-            trip["start_time"] = trip["start_time"].isoformat() if isinstance(trip["start_time"], datetime) else trip["start_time"]
+            formatted_start = to_ist_display(trip.get("start_time") or trip.get("start"))
+            formatted_end = to_ist_display(trip.get("end_time") or trip.get("end"))
+            trip["start_time"] = formatted_start
+            trip["end_time"] = formatted_end
+            trip["start"] = formatted_start
+            trip["end"] = formatted_end
+            trip["max_speed"] = compute_max_speed(trip)
+            path = trip.get("path", [])
+            total_distance = 0.0
+
+            for i in range(1, len(path)):
+                prev = path[i - 1]
+                curr = path[i]
+
+                total_distance += haversine_distance(
+                    float(prev.get("lat", 0)),
+                    float(prev.get("lon", 0)),
+                    float(curr.get("lat", 0)),
+                    float(curr.get("lon", 0))
+                )
+
+            trip["distance_km"] = round(total_distance, 2)
         return jsonify({"trips": trips}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -94,9 +162,13 @@ def get_trip(trip_id):
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
         trip["_id"] = str(trip["_id"])
-        trip["start_time"] = trip["start_time"].isoformat() if isinstance(trip["start_time"], datetime) else trip["start_time"]
-        if trip.get("end_time"):
-            trip["end_time"] = trip["end_time"].isoformat() if isinstance(trip["end_time"], datetime) else trip["end_time"]
+        formatted_start = to_ist_display(trip.get("start_time") or trip.get("start"))
+        formatted_end = to_ist_display(trip.get("end_time") or trip.get("end"))
+        trip["start_time"] = formatted_start
+        trip["end_time"] = formatted_end
+        trip["start"] = formatted_start
+        trip["end"] = formatted_end
+        trip["max_speed"] = compute_max_speed(trip)
         return jsonify(trip), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -179,10 +251,11 @@ def add_location(trip_id):
         
         # Create location point
         location_point = {
-            "lat": location_data["latitude"],
-            "lon": location_data["longitude"],
-            "timestamp": location_data["timestamp"]
-        }
+        "lat": location_data["latitude"],
+        "lon": location_data["longitude"],
+        "speed": location_data["speed"],
+        "timestamp": location_data["timestamp"]
+    }
         
         # Append location to path array using $push (append, never overwrite)
         result = trips_collection.update_one(
@@ -265,7 +338,7 @@ def end_trip(trip_id):
             "trip_id": trip_id,
             "status": "COMPLETED",
             "sensor_records_collected": sensor_count,
-            "end_time": datetime.utcnow().isoformat()
+            "end_time": to_ist_display(datetime.utcnow())
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500

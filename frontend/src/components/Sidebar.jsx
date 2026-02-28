@@ -4,10 +4,6 @@ import { NavLink } from 'react-router-dom'
 export default function Sidebar() {
   return (
     <aside className="sidebar">
-      <div className="sidebar-top">
-        <h2 className="logo">DriverDash</h2>
-        <div className="tag">Module 5</div>
-      </div>
       <nav>
         <ul>
           <li>

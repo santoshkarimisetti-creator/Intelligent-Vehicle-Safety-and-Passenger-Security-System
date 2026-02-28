@@ -1,7 +1,7 @@
 package com.example.passengerapp;
 
 import android.os.Bundle;
-
+import android.widget.TextView;
 import androidx.activity.EdgeToEdge;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.graphics.Insets;
@@ -27,7 +27,8 @@ import android.content.pm.PackageManager;
 import androidx.core.app.ActivityCompat;
 import androidx.annotation.NonNull;
 import com.google.android.gms.location.Priority;
-
+import java.util.List;
+import java.util.ArrayList;
 
 
 
@@ -38,6 +39,10 @@ public class MainActivity extends AppCompatActivity
 
     Button btnStart, btnStop, btnSOS;
     String currentTripId = null;
+    private Location lastLocation = null;
+    private TextView txtSpeed;
+    private List<Float> speedBuffer = new ArrayList<>();
+    private int bufferSize = 5;
     FusedLocationProviderClient locationClient;
     LocationCallback locationCallback;
     @Override
@@ -66,6 +71,7 @@ public class MainActivity extends AppCompatActivity
         super.onCreate(savedInstanceState);
         EdgeToEdge.enable(this);
         setContentView(R.layout.activity_main);
+        txtSpeed = findViewById(R.id.txtSpeed);
         locationClient = LocationServices.getFusedLocationProviderClient(this);
         btnStart = findViewById(R.id.btnStart);
         btnStop  = findViewById(R.id.btnStop);
@@ -84,7 +90,7 @@ public class MainActivity extends AppCompatActivity
             @Override
             public void onClick(View v) {
 
-                String url = "http://10.218.7.120:5000/trips";
+                String url = "http://172.29.136.120:5000/trips";
 
                 RequestQueue queue = Volley.newRequestQueue(MainActivity.this);
 
@@ -110,9 +116,17 @@ public class MainActivity extends AppCompatActivity
                             }
                         },
                         error -> {
+                            String message = "Unknown error";
+
+                            if (error.networkResponse != null) {
+                                message = "Error Code: " + error.networkResponse.statusCode;
+                            } else if (error.getMessage() != null) {
+                                message = error.getMessage();
+                            }
+
                             Toast.makeText(MainActivity.this,
-                                    "Failed to start trip",
-                                    Toast.LENGTH_SHORT).show();
+                                    message,
+                                    Toast.LENGTH_LONG).show();
                         }
                 );
 
@@ -132,7 +146,7 @@ public class MainActivity extends AppCompatActivity
                 }
 
                 // 2. Prepare URL
-                String url = "http://10.218.7.120:5000/trips/" + currentTripId + "/end";
+                String url = "http://172.29.136.120:5000/trips/" + currentTripId + "/end";
 
                 RequestQueue queue = Volley.newRequestQueue(MainActivity.this);
 
@@ -183,16 +197,51 @@ public class MainActivity extends AppCompatActivity
                 }
 
                 for (Location location : locationResult.getLocations()) {
-                    double lat = location.getLatitude();
-                    double lon = location.getLongitude();
-                    long time = location.getTime();
-                    sendLocationToBackend(lat, lon, time);
-                    // TEMPORARY: show as toast (for verification)
-                    Toast.makeText(
-                            MainActivity.this,
-                            "Lat: " + lat + " Lon: " + lon,
-                            Toast.LENGTH_SHORT
-                    ).show();
+
+                    // Ignore bad accuracy
+                    if (location.hasAccuracy() && location.getAccuracy() > 20) {
+                        continue;
+                    }
+
+                    // --- ALWAYS UPDATE SPEED UI ---
+                    float speedMps = location.getSpeed();
+                    float speedKmph = speedMps * 3.6f;
+
+                    speedBuffer.add(speedKmph);
+                    if (speedBuffer.size() > bufferSize) {
+                        speedBuffer.remove(0);
+                    }
+
+                    float sum = 0;
+                    for (float s : speedBuffer) {
+                        sum += s;
+                    }
+                    float smoothedSpeed = sum / speedBuffer.size();
+
+                    txtSpeed.setText(String.format("Speed: %.2f km/h", smoothedSpeed));
+
+                    if (smoothedSpeed > 80) {
+                        txtSpeed.setTextColor(getResources().getColor(android.R.color.holo_red_dark));
+                    } else {
+                        txtSpeed.setTextColor(getResources().getColor(android.R.color.white));
+                    }
+
+                    // --- ONLY SEND TO BACKEND IF MOVED > 5m ---
+                    if (lastLocation != null) {
+                        float distance = lastLocation.distanceTo(location);
+                        if (distance < 5) {
+                            continue;  // Skip backend update, but UI already updated
+                        }
+                    }
+
+                    lastLocation = location;
+
+                    sendLocationToBackend(
+                            location.getLatitude(),
+                            location.getLongitude(),
+                            location.getTime(),
+                            smoothedSpeed
+                    );
                 }
 
             }
@@ -220,6 +269,7 @@ public class MainActivity extends AppCompatActivity
         LocationRequest locationRequest =
                 new LocationRequest.Builder(5000)
                         .setMinUpdateIntervalMillis(3000)
+                        .setMinUpdateDistanceMeters(5)
                         .setPriority(Priority.PRIORITY_HIGH_ACCURACY)
                         .build();
 
@@ -239,10 +289,9 @@ public class MainActivity extends AppCompatActivity
                     Toast.LENGTH_SHORT).show();
         }
     }
-    private void sendLocationToBackend(double lat, double lon, long time) {
+    private void sendLocationToBackend(double lat, double lon, long time, float speed) {
 
-        String url = "http://10.218.7.120:5000/trips/"
-                + currentTripId + "/location";
+        String url = "http://172.29.136.120:5000/trips/" + currentTripId + "/location";
 
         RequestQueue queue = Volley.newRequestQueue(this);
 
@@ -250,6 +299,7 @@ public class MainActivity extends AppCompatActivity
         try {
             body.put("latitude", lat);
             body.put("longitude", lon);
+            body.put("speed", speed);
             body.put("timestamp", time);
         } catch (JSONException e) {
             e.printStackTrace();

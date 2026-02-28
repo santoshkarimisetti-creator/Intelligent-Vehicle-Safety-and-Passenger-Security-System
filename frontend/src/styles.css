@@ -44,6 +44,7 @@ body,html,#root{height:100%;margin:0}
 .trips-table th,.trips-table td{padding:10px;border-bottom:1px solid #f0f3f8;text-align:left}
 .view-btn{background:var(--accent);color:#fff;padding:6px 10px;border-radius:6px;text-decoration:none}
 .list-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+.header-filters{display:flex;align-items:center;gap:8px}
 .search{padding:8px 10px;border:1px solid #e3e8ef;border-radius:8px;width:260px}
 .detail-grid{display:grid;grid-template-columns:1fr 320px;gap:12px}
 .fullmap{grid-column:1 / span 2;height:360px}

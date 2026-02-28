@@ -1,7 +1,7 @@
 import React, {useEffect, useMemo, useState} from 'react'
 import { useParams, Link } from 'react-router-dom'
 import MapReplay from '../components/MapReplay'
-import { getTrip } from '../mockBackend'
+import { getTrip } from '../api/trips'
 
 export default function TripDetail(){
   const { id } = useParams()
@@ -58,10 +58,15 @@ export default function TripDetail(){
         <section className="card stats">
           <h3>Trip Summary</h3>
           <ul>
+            <li>Trip ID: {trip?.id || id || '-'}</li>
             <li>Driver ID: {trip?.driver || '-'}</li>
             <li>Status: {trip?.status || '-'}</li>
-            <li>Start Time: {trip?.start || '-'}</li>
-            <li>End Time: {trip?.end || '-'}</li>
+            <li>
+            Start Time: {trip?.start || '-'}
+          </li>
+          <li>
+            End Time: {trip?.end || '-'}
+          </li>
             <li>Max Speed: {trip?.maxSpeed ?? '-'}</li>
             <li>Risk Level: {trip?.risk || 'Unknown'}</li>
           </ul>
