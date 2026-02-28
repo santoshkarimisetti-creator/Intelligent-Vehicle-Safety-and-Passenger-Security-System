@@ -1,0 +1,5 @@
+flask==3.0.2
+flask-cors==4.0.0
+opencv-python>=4.10.0
+numpy>=1.24.0,<3.0.0
+mediapipe>=0.10.0

@@ -169,7 +169,95 @@ def get_trip(trip_id):
         trip["start"] = formatted_start
         trip["end"] = formatted_end
         trip["max_speed"] = compute_max_speed(trip)
+        trip["ai_events"] = trip.get("ai_events", [])
+        trip["sos_triggered"] = trip.get("sos_triggered", False)
+        trip["sos_events"] = trip.get("sos_events", [])
         return jsonify(trip), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/trips/<trip_id>/ai-results")
+def add_ai_result(trip_id):
+    """Receive AI-engine detection/risk result and attach it to trip record."""
+    try:
+        trip = trips_collection.find_one({"trip_id": trip_id})
+        if not trip:
+            return jsonify({"error": "Trip not found"}), 404
+
+        payload = request.get_json(silent=True) or {}
+
+        event = {
+            "timestamp": payload.get("timestamp") or datetime.utcnow().isoformat(),
+            "detections": payload.get("detections", []),
+            "risk_score": payload.get("risk_score"),
+            "risk_level": payload.get("risk_level", "UNKNOWN"),
+            "reasons": payload.get("reasons", []),
+            "metadata": payload.get("metadata", {}),
+            "source": "ai_engine"
+        }
+
+        update_doc = {
+            "$set": {
+                "risk_score": payload.get("risk_score"),
+                "risk_level": payload.get("risk_level", "UNKNOWN"),
+                "last_ai_update": datetime.utcnow()
+            },
+            "$push": {
+                "ai_events": event
+            }
+        }
+
+        trips_collection.update_one({"trip_id": trip_id}, update_doc)
+
+        return jsonify({
+            "message": "AI result recorded",
+            "trip_id": trip_id,
+            "risk_level": payload.get("risk_level", "UNKNOWN"),
+            "risk_score": payload.get("risk_score")
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/trips/<trip_id>/sos")
+def add_sos_event(trip_id):
+    """Receive SOS event from AI engine or mobile app."""
+    try:
+        trip = trips_collection.find_one({"trip_id": trip_id})
+        if not trip:
+            return jsonify({"error": "Trip not found"}), 404
+
+        payload = request.get_json(silent=True) or {}
+
+        sos_event = {
+            "event_type": "SOS",
+            "timestamp": payload.get("timestamp") or datetime.utcnow().isoformat(),
+            "source": payload.get("source", "unknown"),
+            "duration": payload.get("duration", 0.0),
+            "metadata": payload.get("metadata", {}),
+            "received_at": datetime.utcnow()
+        }
+
+        # Update trip with SOS flag and add to events
+        update_doc = {
+            "$set": {
+                "sos_triggered": True,
+                "sos_timestamp": datetime.utcnow()
+            },
+            "$push": {
+                "sos_events": sos_event
+            }
+        }
+
+        trips_collection.update_one({"trip_id": trip_id}, update_doc)
+
+        return jsonify({
+            "message": "SOS event recorded",
+            "trip_id": trip_id,
+            "source": payload.get("source", "unknown"),
+            "timestamp": sos_event["timestamp"]
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

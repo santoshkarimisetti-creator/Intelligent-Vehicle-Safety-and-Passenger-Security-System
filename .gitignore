@@ -1,9 +1,36 @@
-# ===== Python / Backend =====
+# ===== Python / Backend / AI Engine =====
 backend/.venv/
 backend/__pycache__/
 backend/*.log
 backend/server.log
+ai_engine/.venv/
+ai_engine/__pycache__/
+ai_engine/*.log
+.venv/
+venv/
+env/
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
 # ===== Android =====
 android/**/build/
@@ -28,8 +55,43 @@ yarn-error.log*
 pnpm-debug.log*
 vite.config.*.timestamp-*
 
+# ===== Database / Environment =====
+.env
+.env.local
+.env.*.local
+
 # ===== IDE / OS =====
 .idea/
 .vscode/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ===== Project Specific =====
+.cache/
+*.cache
+temp/
+tmp/
+logs/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# ===== OS Files =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+desktop.ini
