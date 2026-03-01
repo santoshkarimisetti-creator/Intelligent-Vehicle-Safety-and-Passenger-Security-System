@@ -10,6 +10,7 @@ function mapTrip(trip){
     driver: trip.driver_id || trip.driver || '',
     start: trip.start_time || trip.start || '',
     end: trip.end_time || trip.end || '',
+    durationMinutes: trip.duration_minutes || 0,
     maxSpeed: Number(trip.max_speed ?? trip.maxSpeed ?? 0),
     distanceKm: computeDistanceKm(trip),
     risk: trip.risk_level || trip.risk || 'Unknown',
@@ -22,22 +23,9 @@ export async function getTrips(){
   if(!res.ok) throw new Error('Failed to fetch trips')
   const data = await res.json()
   const trips = Array.isArray(data.trips) ? data.trips : []
-
-  const tripsWithDistance = await Promise.all(trips.map(async trip => {
-    try {
-      const distRes = await fetch(`${API_BASE}/trips/${encodeURIComponent(trip.trip_id)}/distance`)
-      if(distRes.ok){
-        const distData = await distRes.json()
-        trip.distance_km = distData.distance_km || 0
-      }
-    } catch(e) {
-      console.warn(`Failed to fetch distance for trip ${trip.trip_id}`, e)
-      trip.distance_km = 0
-    }
-    return trip
-  }))
-
-  return tripsWithDistance.map(mapTrip)
+  
+  // Backend already computes distance_km in /trips endpoint
+  return trips.map(mapTrip)
 }
 
 export async function getTrip(id){

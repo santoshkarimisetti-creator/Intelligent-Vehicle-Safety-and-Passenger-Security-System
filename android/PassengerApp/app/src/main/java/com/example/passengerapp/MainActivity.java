@@ -1,6 +1,9 @@
 package com.example.passengerapp;
 
 import android.os.Bundle;
+import android.os.Build;
+import android.os.VibrationEffect;
+import android.os.Vibrator;
 import android.widget.TextView;
 import androidx.activity.EdgeToEdge;
 import androidx.appcompat.app.AppCompatActivity;
@@ -24,6 +27,7 @@ import com.google.android.gms.location.LocationRequest;
 import com.google.android.gms.location.LocationResult;
 import com.google.android.gms.location.LocationServices;
 import android.content.pm.PackageManager;
+import android.content.Context;
 import androidx.core.app.ActivityCompat;
 import androidx.annotation.NonNull;
 import com.google.android.gms.location.Priority;
@@ -45,6 +49,7 @@ public class MainActivity extends AppCompatActivity
     private int bufferSize = 5;
     FusedLocationProviderClient locationClient;
     LocationCallback locationCallback;
+    private ConfigManager configManager;
     @Override
     public void onRequestPermissionsResult(
             int requestCode,
@@ -71,6 +76,8 @@ public class MainActivity extends AppCompatActivity
         super.onCreate(savedInstanceState);
         EdgeToEdge.enable(this);
         setContentView(R.layout.activity_main);
+        configManager = new ConfigManager(this);
+        configManager.refreshBackendUrlAsync();
         txtSpeed = findViewById(R.id.txtSpeed);
         locationClient = LocationServices.getFusedLocationProviderClient(this);
         btnStart = findViewById(R.id.btnStart);
@@ -89,8 +96,9 @@ public class MainActivity extends AppCompatActivity
         btnStart.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                vibrateOnTap();
 
-                String url = "http://172.29.136.120:5000/trips";
+                String url = configManager.buildUrl("/trips");
 
                 RequestQueue queue = Volley.newRequestQueue(MainActivity.this);
 
@@ -127,6 +135,7 @@ public class MainActivity extends AppCompatActivity
                             Toast.makeText(MainActivity.this,
                                     message,
                                     Toast.LENGTH_LONG).show();
+                                handleConnectionFailure();
                         }
                 );
 
@@ -136,6 +145,7 @@ public class MainActivity extends AppCompatActivity
         btnStop.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                vibrateOnTap();
 
                 // 1. Check if there is an active trip
                 if (currentTripId == null) {
@@ -146,7 +156,7 @@ public class MainActivity extends AppCompatActivity
                 }
 
                 // 2. Prepare URL
-                String url = "http://172.29.136.120:5000/trips/" + currentTripId + "/end";
+                String url = configManager.buildUrl("/trips/" + currentTripId + "/end");
 
                 RequestQueue queue = Volley.newRequestQueue(MainActivity.this);
 
@@ -165,6 +175,7 @@ public class MainActivity extends AppCompatActivity
                             Toast.makeText(MainActivity.this,
                                     "Failed to end trip",
                                     Toast.LENGTH_SHORT).show();
+                            handleConnectionFailure();
                         }
                 );
 
@@ -175,15 +186,49 @@ public class MainActivity extends AppCompatActivity
         btnSOS.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
+                vibrateOnTap();
 
                 if (currentTripId == null) {
                     Toast.makeText(MainActivity.this,
                             "SOS pressed (no active trip)",
                             Toast.LENGTH_SHORT).show();
                 } else {
-                    Toast.makeText(MainActivity.this,
-                            "SOS triggered during trip",
-                            Toast.LENGTH_SHORT).show();
+                    // Send SOS event to backend
+                    String url = configManager.buildUrl("/trips/" + currentTripId + "/sos");
+                    RequestQueue queue = Volley.newRequestQueue(MainActivity.this);
+
+                    JSONObject body = new JSONObject();
+                    try {
+                        body.put("source", "mobile_app");
+                        body.put("timestamp", System.currentTimeMillis());
+                    } catch (JSONException e) {
+                        e.printStackTrace();
+                    }
+
+                    JsonObjectRequest request = new JsonObjectRequest(
+                            Request.Method.POST,
+                            url,
+                            body,
+                            response -> {
+                                Toast.makeText(MainActivity.this,
+                                        "SOS triggered - Emergency services notified",
+                                        Toast.LENGTH_LONG).show();
+                            },
+                            error -> {
+                                String message = "SOS Failed";
+                                if (error.networkResponse != null) {
+                                    message = "SOS Error: " + error.networkResponse.statusCode;
+                                } else if (error.getMessage() != null) {
+                                    message = "SOS Error: " + error.getMessage();
+                                }
+                                Toast.makeText(MainActivity.this,
+                                        message,
+                                        Toast.LENGTH_LONG).show();
+                                handleConnectionFailure();
+                            }
+                    );
+
+                    queue.add(request);
                 }
 
             }
@@ -202,6 +247,14 @@ public class MainActivity extends AppCompatActivity
                     if (location.hasAccuracy() && location.getAccuracy() > 20) {
                         continue;
                     }
+                    double latitude = location.getLatitude();
+                    double longitude = location.getLongitude();
+
+                    runOnUiThread(() -> {
+                        Toast.makeText(MainActivity.this,
+                                "Lat: " + latitude + "\nLon: " + longitude,
+                                Toast.LENGTH_SHORT).show();
+                    });
 
                     // --- ALWAYS UPDATE SPEED UI ---
                     float speedMps = location.getSpeed();
@@ -264,6 +317,22 @@ public class MainActivity extends AppCompatActivity
             startLocationUpdates();
         }
     }
+
+    private void vibrateOnTap() {
+        try {
+            Vibrator vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
+            if (vibrator == null || !vibrator.hasVibrator()) {
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(40, VibrationEffect.DEFAULT_AMPLITUDE));
+            } else {
+                vibrator.vibrate(40);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
     private void startLocationUpdates() {
 
         LocationRequest locationRequest =
@@ -291,7 +360,7 @@ public class MainActivity extends AppCompatActivity
     }
     private void sendLocationToBackend(double lat, double lon, long time, float speed) {
 
-        String url = "http://172.29.136.120:5000/trips/" + currentTripId + "/location";
+        String url = configManager.buildUrl("/trips/" + currentTripId + "/location");
 
         RequestQueue queue = Volley.newRequestQueue(this);
 
@@ -313,10 +382,15 @@ public class MainActivity extends AppCompatActivity
                     // success → no UI action needed
                 },
                 error -> {
-                    // optional: log error
+                    handleConnectionFailure();
                 }
         );
 
         queue.add(request);
+    }
+
+    private void handleConnectionFailure() {
+        configManager.clearCache();
+        configManager.refreshBackendUrlAsync();
     }
 }

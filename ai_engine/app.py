@@ -767,12 +767,46 @@ def _compute_risk(payload: Dict[str, Any], detection_result: Dict[str, Any] | No
     }
 
 
+def _is_trip_active(trip_id: str) -> bool:
+    """
+    Check if a trip is currently active.
+    Returns: True if active or if check fails (fallback), False if explicitly inactive.
+    """
+    if not trip_id:
+        return False
+    
+    try:
+        check_url = f"{BACKEND_BASE_URL.rstrip('/')}/is-active-trip/{trip_id}"
+        check_req = Request(check_url, method="GET")
+        with urlopen(check_req, timeout=5) as check_resp:
+            check_data = json.loads(check_resp.read().decode("utf-8"))
+            return check_data.get("is_active", False)
+    except Exception:
+        # If check fails, assume trip is active (fallback to old behavior)
+        return True
+
+
 def _post_result_to_backend(result_payload: Dict[str, Any]) -> Tuple[bool, str]:
+    """Post AI results to backend. Routes to /trips/{id}/ai-results if active trip, else to /events."""
     trip_id = result_payload.get("trip_id")
     if not trip_id:
         return False, "trip_id missing; callback skipped"
 
-    endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/trips/{trip_id}/ai-results"
+    try:
+        # Check if trip is active
+        is_active = _is_trip_active(trip_id)
+    except Exception:
+        # If check fails, assume trip is active (fallback to old behavior)
+        is_active = True
+
+    # Route to appropriate endpoint
+    if is_active:
+        endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/trips/{trip_id}/ai-results"
+    else:
+        # No active trip - post to general events collection
+        endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/events"
+        result_payload["is_sos"] = result_payload.get("sos_triggered", False)
+    
     try:
         body = json.dumps(result_payload).encode("utf-8")
         req = Request(
@@ -795,13 +829,28 @@ def _post_result_to_backend(result_payload: Dict[str, Any]) -> Tuple[bool, str]:
 
 
 def _post_sos_event_to_backend(sos_payload: Dict[str, Any]) -> Tuple[bool, str]:
-    """Send SOS event to backend."""
+    """
+    Send SOS event to backend with dual-mode routing.
+    If trip is active: route to /trips/{trip_id}/sos
+    If trip is inactive: route to /events with is_sos=True flag
+    """
     trip_id = sos_payload.get("trip_id")
     if not trip_id:
         return False, "trip_id missing"
 
-    endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/trips/{trip_id}/sos"
     try:
+        # Check if trip is active
+        is_active = _is_trip_active(trip_id)
+
+        # Determine endpoint based on trip status
+        if is_active:
+            # Route to trip-specific SOS endpoint
+            endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/trips/{trip_id}/sos"
+        else:
+            # Route to events collection with is_sos flag
+            endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/events"
+            sos_payload["is_sos"] = True
+
         body = json.dumps(sos_payload).encode("utf-8")
         req = Request(
             endpoint,
@@ -879,6 +928,12 @@ def analyze_frame() -> Any:
     sos_gesture = detection_result.get("sos_gesture", {})
     sos_triggered = sos_gesture.get("sos_triggered", False)
     
+    # Check if trip is active before allowing SOS trigger
+    # SOS only triggers when there is an active trip
+    trip_is_active = _is_trip_active(trip_id) if trip_id else False
+    if not trip_is_active:
+        sos_triggered = False
+    
     event_counters = risk_result.get("event_counters", {})
 
     ts = datetime.now(timezone.utc).isoformat()
@@ -906,8 +961,9 @@ def analyze_frame() -> Any:
 
     sent_to_backend, callback_message = _post_result_to_backend(result_payload)
     
-    # If SOS triggered, also send separate SOS event to backend
-    if sos_triggered:
+    # If SOS triggered AND trip is active, send separate SOS event to backend
+    # SOS only posts when there is an active trip
+    if sos_triggered and trip_is_active:
         sos_event_payload = {
             "trip_id": trip_id,
             "event_type": "SOS",

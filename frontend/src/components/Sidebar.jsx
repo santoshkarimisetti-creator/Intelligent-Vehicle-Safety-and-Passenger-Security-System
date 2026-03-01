@@ -13,10 +13,14 @@ export default function Sidebar() {
             <NavLink to="/trips" className={({isActive}) => isActive? 'active navlink':'navlink'}>🗺️ Trips</NavLink>
           </li>
           <li>
-            <NavLink to="/events" className={({isActive}) => isActive? 'active navlink':'navlink'}>🚨 Emergency Events</NavLink>
+            <NavLink to="/events" className={({isActive}) => isActive? 'active navlink':'navlink'}>� Detection Events</NavLink>
+          </li>
+          <li>
+            <NavLink to="/events/emergency" className={({isActive}) => isActive? 'active navlink':'navlink'}>🚨 SOS Alerts</NavLink>
           </li>
         </ul>
       </nav>
     </aside>
   )
 }
+

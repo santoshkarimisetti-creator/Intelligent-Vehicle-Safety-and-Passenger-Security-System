@@ -5,6 +5,8 @@ import Header from './components/Header'
 import LiveMonitoring from './pages/LiveMonitoring'
 import Trips from './pages/Trips'
 import TripDetail from './pages/TripDetail'
+import EventsPage from './pages/EventsPage'
+import EmergencyEventsPage from './pages/EmergencyEventsPage'
 
 export default function App() {
   return (
@@ -18,7 +20,8 @@ export default function App() {
           <Route path="/live" element={<LiveMonitoring />} />
           <Route path="/trips" element={<Trips />} />
           <Route path="/trips/:id" element={<TripDetail />} />
-          <Route path="/events" element={<Trips />} />
+          <Route path="/events" element={<EventsPage />} />
+          <Route path="/events/emergency" element={<EmergencyEventsPage />} />
         </Routes>
         </main>
       </div>

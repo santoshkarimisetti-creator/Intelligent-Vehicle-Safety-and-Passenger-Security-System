@@ -46,9 +46,11 @@ body,html,#root{height:100%;margin:0}
 .list-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
 .header-filters{display:flex;align-items:center;gap:8px}
 .search{padding:8px 10px;border:1px solid #e3e8ef;border-radius:8px;width:260px}
-.detail-grid{display:grid;grid-template-columns:1fr 320px;gap:12px}
-.fullmap{grid-column:1 / span 2;height:360px}
+.detail-grid{display:grid;grid-template-columns:1fr 240px;grid-template-rows:500px auto;gap:12px;min-height:calc(100vh - 200px)}
+.fullmap{grid-column:1 / span 2;height:500px;min-height:400px;position:relative}
 .map-placeholder{height:100%;display:flex;align-items:center;justify-content:center;background:#e9eef8;border-radius:6px}
+.card.stats{max-height:350px;overflow-y:auto}
+.card.alerts{grid-column:1 / span 2;min-height:400px;max-height:600px;overflow-y:auto}
 .alerts table{width:100%;border-collapse:collapse}
 .alerts th,.alerts td{padding:6px;border-bottom:1px solid #eee}
 .emergency{background:#b71c1c;color:#fff;padding:10px;border-radius:6px;margin-bottom:12px}
@@ -60,4 +62,6 @@ body,html,#root{height:100%;margin:0}
 	.camera{grid-row:auto;min-height:auto}
 	.camera video{height:240px}
 	.main-area{height:100%}
+	.detail-grid{grid-template-columns:1fr;min-height:auto}
+	.fullmap{grid-column:1;height:400px;min-height:300px}
 }

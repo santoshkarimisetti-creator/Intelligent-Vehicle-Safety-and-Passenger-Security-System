@@ -57,6 +57,7 @@ export default function Trips(){
             <th>Driver ID</th>
             <th>Start Time</th>
             <th>End Time</th>
+            <th>Duration</th>
             <th>Max Speed</th>
             <th>Distance</th>
             <th>Risk Level</th>
@@ -71,6 +72,7 @@ export default function Trips(){
               <td>{t.driver}</td>
               <td>{t.start}</td>
               <td>{t.end || '-'}</td>
+              <td>{t.durationMinutes ? `${t.durationMinutes} min` : '-'}</td>
               <td>{t.maxSpeed}</td>
               <td>{t.distanceKm ? `${t.distanceKm.toFixed(2)} km` : '0 km'}</td>
               <td><span className={`pill ${t.risk.toLowerCase()}`}>{t.risk}</span></td>

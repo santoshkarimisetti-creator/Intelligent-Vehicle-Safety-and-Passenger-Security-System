@@ -87,6 +87,22 @@ htmlcov/
 .tox/
 .hypothesis/
 
+# ===== Temporary Scripts for Database Maintenance =====
+backend/migrate_trips.py
+backend/check_sos_trips.py
+backend/add_ai_sos_trip.py
+backend/insert_test_sos_data.py
+backend/server.log
+
+# ===== Database Data (Should NOT be pushed) =====
+mongodb/
+data/
+*.db
+*.sqlite
+*.sqlite3
+mongo_data/
+db_data/
+
 # ===== OS Files =====
 .DS_Store
 .DS_Store?

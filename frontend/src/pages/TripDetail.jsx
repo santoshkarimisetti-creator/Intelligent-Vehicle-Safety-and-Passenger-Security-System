@@ -67,6 +67,7 @@ export default function TripDetail(){
           <li>
             End Time: {trip?.end || '-'}
           </li>
+            <li>Distance: {trip?.distanceKm ? `${trip.distanceKm} km` : '-'}</li>
             <li>Max Speed: {trip?.maxSpeed ?? '-'}</li>
             <li>Risk Level: {trip?.risk || 'Unknown'}</li>
           </ul>
