@@ -1,5 +1,6 @@
 import React, {useEffect, useRef, useState} from 'react'
 import { subscribeLive } from '../services/liveTelemetry'
+import { captureFrame, analyzeFrame, checkAIEngineHealth } from '../services/aiEngineService'
 import LiveMap from '../components/LiveMap'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
@@ -14,6 +15,9 @@ export default function LiveMonitoring(){
   const [position, setPosition] = useState(null)
   const [distanceKm, setDistanceKm] = useState(0)
   const [tripId, setTripId] = useState(null)
+  const [aiEngineStatus, setAIEngineStatus] = useState(false)
+  const [detections, setDetections] = useState([])
+  const [analysisError, setAnalysisError] = useState(null)
 
   useEffect(()=>{
     // start webcam
@@ -26,6 +30,9 @@ export default function LiveMonitoring(){
       }
     }
     startCam()
+
+    // Check AI engine health
+    checkAIEngineHealth().then(setAIEngineStatus)
 
     // subscribe to live telemetry (mock) so you can see speed/map without backend
     const unsub = subscribeLive(data =>{
@@ -64,16 +71,93 @@ export default function LiveMonitoring(){
     return () => clearInterval(interval)
   },[tripId])
 
+  // AI Engine Integration: Send frames for analysis
+  useEffect(() => {
+    if (!aiEngineStatus || !tripId || !videoRef.current) return
+
+    const analyzeVideoFrame = async () => {
+      try {
+        const frameData = captureFrame(videoRef.current)
+        if (!frameData) return
+
+        const result = await analyzeFrame(frameData, tripId, speed)
+        
+        // Update UI with AI results
+        if (result.risk_score_weighted !== undefined) {
+          setRisk(result.risk_score_weighted)
+        }
+
+        // Update detections
+        if (result.detections && result.detections.length > 0) {
+          setDetections(result.detections)
+          
+          // Update driver status based on detections
+          const hasDrowsiness = result.detections.some(d => d.type === 'drowsiness')
+          const hasDistraction = result.detections.some(d => d.type === 'distraction')
+          
+          if (hasDrowsiness) {
+            setDriverStatus('DROWSY')
+          } else if (hasDistraction) {
+            setDriverStatus('DISTRACTED')
+          } else {
+            setDriverStatus('ALERT')
+          }
+        } else {
+          setDetections([])
+          setDriverStatus('ALERT')
+        }
+
+        // Handle SOS trigger
+        if (result.sos_triggered) {
+          setSos(true)
+          setTimeout(() => setSos(false), 10000) // Clear after 10 seconds
+        }
+
+        setAnalysisError(null)
+      } catch (error) {
+        console.error('Frame analysis error:', error)
+        setAnalysisError(error.message)
+      }
+    }
+
+    // Analyze frames every 2 seconds (adjust as needed)
+    const interval = setInterval(analyzeVideoFrame, 2000)
+    
+    return () => clearInterval(interval)
+  }, [aiEngineStatus, tripId, speed])
+
   return (
     <div className="page live">
       {sos && <div className="emergency">EMERGENCY: SOS triggered</div>}
+      {analysisError && (
+        <div style={{background: '#ffa500', color: '#fff', padding: '8px', marginBottom: '8px', borderRadius: '4px'}}>
+          AI Engine: {analysisError}
+        </div>
+      )}
       <div className="live-grid">
         <div className="card camera">
           <video ref={videoRef} autoPlay playsInline muted />
           <div className="speed-overlay">
             <div>Speed: {Math.round(speed)} km/h</div>
             <div className="distance-inline">Distance: {distanceKm.toFixed(2)} km</div>
+            {aiEngineStatus && <div style={{fontSize: '10px', marginTop: '4px'}}>🤖 AI: Active</div>}
           </div>
+          {detections.length > 0 && (
+            <div style={{
+              position: 'absolute',
+              top: '14px',
+              right: '14px',
+              background: 'rgba(255,0,0,0.8)',
+              color: '#fff',
+              padding: '6px 10px',
+              borderRadius: '6px',
+              fontSize: '11px'
+            }}>
+              {detections.map((d, i) => (
+                <div key={i}>{d.type}: {(d.confidence * 100).toFixed(0)}%</div>
+              ))}
+            </div>
+          )}
           <div className="caption">Live Camera Feed</div>
         </div>
 
@@ -86,6 +170,14 @@ export default function LiveMonitoring(){
             </div>
           </div>
           <div className="stat"><strong>Driver</strong><div className="value"><span className={`badge ${driverStatus==='ALERT'?'green':driverStatus==='DROWSY'?'orange':'red'}`}>{driverStatus}</span></div></div>
+          <div className="stat">
+            <strong>AI Engine</strong>
+            <div className="value">
+              <span className={`badge ${aiEngineStatus ? 'green' : 'red'}`}>
+                {aiEngineStatus ? 'Connected' : 'Offline'}
+              </span>
+            </div>
+          </div>
         </div>
 
         <div className="card map">

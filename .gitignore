@@ -94,6 +94,9 @@ backend/add_ai_sos_trip.py
 backend/insert_test_sos_data.py
 backend/server.log
 
+# ===== Unused Components (Calibration is internal, not a separate page) =====
+frontend/src/pages/CalibrationPage.jsx
+
 # ===== Database Data (Should NOT be pushed) =====
 mongodb/
 data/

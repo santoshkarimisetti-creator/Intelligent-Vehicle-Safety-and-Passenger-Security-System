@@ -10,6 +10,13 @@ from zeroconf import ServiceInfo, Zeroconf
 import socket
 import threading
 import os
+from calibration_model import (
+    get_driver_calibration,
+    create_driver_calibration,
+    update_calibration_samples,
+    get_personalized_thresholds,
+    calibration_collection
+)
 
 
 def _get_lan_ipv4_addresses() -> list[str]:
@@ -814,6 +821,103 @@ def get_emergency_events():
         }), 200
     except Exception as e:
         return jsonify({"error": str(e), "details": str(e)}), 500
+
+
+# ===================== DRIVER CALIBRATION ENDPOINTS =====================
+
+@app.get("/drivers/<driver_id>/calibration")
+def get_driver_calibration_status(driver_id):
+    """Get calibration status and thresholds for a driver."""
+    try:
+        cal = get_driver_calibration(driver_id)
+        
+        if not cal:
+            # Create new calibration if doesn't exist
+            cal = create_driver_calibration(driver_id)
+        
+        return jsonify({
+            "driver_id": driver_id,
+            "calibration_status": cal.get("calibration_status"),
+            "is_calibrated": cal.get("is_calibrated"),
+            "frames_collected": cal.get("frames_collected", 0),
+            "calibration_frames_needed": cal.get("calibration_frames_needed", 10),
+            "thresholds": cal.get("thresholds", {}),
+            "created_at": cal.get("created_at"),
+            "last_updated": cal.get("last_updated")
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/drivers/<driver_id>/calibration/update")
+def update_driver_calibration(driver_id):
+    """Update calibration with new frame metrics (called by AI engine during auto-calibration)."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        frame_metrics = payload.get("metrics", {})
+        
+        # Add samples to driver's calibration
+        update_calibration_samples(driver_id, frame_metrics)
+        
+        cal = get_driver_calibration(driver_id)
+        
+        return jsonify({
+            "driver_id": driver_id,
+            "frames_collected": cal.get("frames_collected", 0),
+            "calibration_status": cal.get("calibration_status"),
+            "is_calibrated": cal.get("is_calibrated")
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/drivers/<driver_id>/thresholds")
+def get_driver_thresholds(driver_id):
+    """Get personalized thresholds for a driver."""
+    try:
+        # Ensure calibration exists
+        if not get_driver_calibration(driver_id):
+            create_driver_calibration(driver_id)
+        
+        thresholds = get_personalized_thresholds(driver_id)
+        
+        return jsonify({
+            "driver_id": driver_id,
+            "thresholds": thresholds
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/drivers/<driver_id>/calibration/reset")
+def reset_driver_calibration(driver_id):
+    """Reset calibration for a driver (collect new baseline)."""
+    try:
+        calibration_collection.update_one(
+            {"driver_id": driver_id},
+            {
+                "$set": {
+                    "calibration_status": "PENDING",
+                    "is_calibrated": False,
+                    "frames_collected": 0,
+                    "ear_open_samples": [],
+                    "ear_closed_samples": [],
+                    "mar_closed_samples": [],
+                    "mar_open_samples": [],
+                    "head_straight_samples": [],
+                    "head_turned_samples": [],
+                    "last_updated": datetime.utcnow().isoformat()
+                }
+            },
+            upsert=True
+        )
+        
+        return jsonify({
+            "driver_id": driver_id,
+            "message": "Calibration reset. New baseline will be collected on next trip."
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":

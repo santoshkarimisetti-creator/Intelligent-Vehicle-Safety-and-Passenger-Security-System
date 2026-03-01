@@ -79,6 +79,80 @@ MOUTH_AR_THRESH = 0.6  # Above this indicates yawning
 HEAD_TURN_THRESH = 25  # Degrees from center
 SOS_DURATION_THRESH = 2.0  # Seconds to hold palm for SOS trigger
 
+# Driver personalization: Cache for thresholds (to avoid backend calls every frame)
+driver_thresholds_cache = {}  # {driver_id: {ear_drowsiness, mar_yawning, head_turn, cached_at}}
+THRESHOLD_CACHE_TTL = 300  # 5 minutes
+
+
+def _get_driver_id_from_trip(trip_id: str) -> str:
+    """Extract or derive driver_id from trip_id (or use trip_id as default)."""
+    # In a real system, query backend to get driver_id from trip
+    # For now, use trip_id as driver identifier
+    return trip_id or "unknown_driver"
+
+
+def _get_cached_thresholds(driver_id: str) -> Dict[str, float]:
+    """Get cached thresholds for driver."""
+    if driver_id in driver_thresholds_cache:
+        cached = driver_thresholds_cache[driver_id]
+        # Check if cache is still fresh
+        if time.time() - cached.get("cached_at", 0) < THRESHOLD_CACHE_TTL:
+            return {
+                "ear_drowsiness": cached.get("ear_drowsiness", EYE_AR_THRESH),
+                "mar_yawning": cached.get("mar_yawning", MOUTH_AR_THRESH),
+                "head_turn": cached.get("head_turn", HEAD_TURN_THRESH)
+            }
+    
+    # Try to fetch from backend if not cached or cache expired
+    try:
+        endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/drivers/{driver_id}/thresholds"
+        with urlopen(Request(endpoint, method="GET"), timeout=2) as response:
+            if response.status == 200:
+                data = json.load(response)
+                thresholds = data.get("thresholds", {})
+                
+                # Cache the result
+                driver_thresholds_cache[driver_id] = {
+                    "ear_drowsiness": thresholds.get("ear_drowsiness", EYE_AR_THRESH),
+                    "mar_yawning": thresholds.get("mar_yawning", MOUTH_AR_THRESH),
+                    "head_turn": thresholds.get("head_turn", HEAD_TURN_THRESH),
+                    "cached_at": time.time()
+                }
+                
+                return driver_thresholds_cache[driver_id]
+    except Exception as e:
+        print(f"Warning: Could not fetch thresholds for {driver_id}: {e}")
+    
+    # Return defaults if backend unavailable
+    return {
+        "ear_drowsiness": EYE_AR_THRESH,
+        "mar_yawning": MOUTH_AR_THRESH,
+        "head_turn": HEAD_TURN_THRESH
+    }
+
+
+def _send_calibration_update(driver_id: str, frame_metrics: Dict[str, Any]) -> bool:
+    """Send frame metrics to backend for calibration collection."""
+    try:
+        payload = {
+            "metrics": frame_metrics
+        }
+        
+        endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/drivers/{driver_id}/calibration/update"
+        body = json.dumps(payload).encode("utf-8")
+        req = Request(
+            endpoint,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with urlopen(req, timeout=2) as response:
+            return 200 <= response.status < 300
+    except Exception as e:
+        print(f"Warning: Could not send calibration update: {e}")
+        return False
+
 # MediaPipe Hand Landmarker (lazy initialization)
 hand_landmarker = None
 
@@ -415,15 +489,27 @@ def _process_frame_with_opencv(image: np.ndarray) -> Dict[str, Any]:
     }
 
 
-def _detect_from_opencv_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
+def _detect_from_opencv_metrics(metrics: Dict[str, Any], thresholds: Dict[str, float] = None) -> Dict[str, Any]:
     """
     Detect drowsiness, yawning, and looking away from OpenCV metrics.
     
-    Thresholds:
-    - EAR < 0.25: Drowsiness (eyes closing)
-    - MAR > 0.6: Yawning (mouth open wide)
-    - |yaw_angle| > 25°: Looking away (head turned)
+    Uses personalized thresholds if provided, otherwise uses defaults:
+    - EAR < threshold: Drowsiness (eyes closing)
+    - MAR > threshold: Yawning (mouth open wide)
+    - |yaw_angle| > threshold: Looking away (head turned)
     """
+    # Use personalized thresholds or defaults
+    if thresholds is None:
+        thresholds = {
+            "ear_drowsiness": EYE_AR_THRESH,
+            "mar_yawning": MOUTH_AR_THRESH,
+            "head_turn": HEAD_TURN_THRESH
+        }
+    
+    ear_thresh = thresholds.get("ear_drowsiness", EYE_AR_THRESH)
+    mar_thresh = thresholds.get("mar_yawning", MOUTH_AR_THRESH)
+    head_thresh = thresholds.get("head_turn", HEAD_TURN_THRESH)
+    
     ear = metrics.get("ear", 0.0)
     mar = metrics.get("mar", 0.0)
     yaw_angle = abs(metrics.get("yaw_angle", 0.0))
@@ -439,36 +525,39 @@ def _detect_from_opencv_metrics(metrics: Dict[str, Any]) -> Dict[str, Any]:
         }
     
     # Drowsiness detection (low EAR)
-    if ear < EYE_AR_THRESH:
-        confidence = 1.0 - (ear / EYE_AR_THRESH)  # Lower EAR = higher confidence
+    if ear < ear_thresh:
+        confidence = 1.0 - (ear / ear_thresh) if ear_thresh > 0 else 0.0  # Lower EAR = higher confidence
         detections.append({
             "type": "drowsiness",
-            "confidence": round(min(1.0, confidence), 3),
+            "confidence": round(min(1.0, max(0.0, confidence)), 3),
             "source": "opencv_haar",
             "metric": "ear",
-            "value": ear
+            "value": ear,
+            "threshold": ear_thresh
         })
     
     # Yawning detection (high MAR)
-    if mar > MOUTH_AR_THRESH:
-        confidence = (mar - MOUTH_AR_THRESH) / 0.4  # MAR above threshold indicates yawning
+    if mar > mar_thresh:
+        confidence = (mar - mar_thresh) / max(0.4, mar_thresh * 0.5)  # MAR above threshold indicates yawning
         detections.append({
             "type": "yawning",
-            "confidence": round(min(1.0, confidence), 3),
+            "confidence": round(min(1.0, max(0.0, confidence)), 3),
             "source": "opencv_haar",
             "metric": "mar",
-            "value": mar
+            "value": mar,
+            "threshold": mar_thresh
         })
     
     # Looking away detection (high yaw angle)
-    if yaw_angle > HEAD_TURN_THRESH:
-        confidence = (yaw_angle - HEAD_TURN_THRESH) / 20  # Yaw > threshold indicates looking away
+    if yaw_angle > head_thresh:
+        confidence = (yaw_angle - head_thresh) / max(20, head_thresh * 0.8)  # Yaw > threshold indicates looking away
         detections.append({
             "type": "distraction",
-            "confidence": round(min(1.0, confidence), 3),
+            "confidence": round(min(1.0, max(0.0, confidence)), 3),
             "source": "opencv_haar",
             "metric": "yaw_angle",
-            "value": yaw_angle
+            "value": yaw_angle,
+            "threshold": head_thresh
         })
     
     return {
@@ -487,28 +576,47 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Compute detections from either:
-    1. Base64 image data (uses OpenCV with Haar Cascades)
+    1. Base64 image data (uses OpenCV with Haar Cascades + personalized thresholds)
     2. Pre-computed signal scores (legacy mode)
     """
     # Check if image data is provided
     image_data = payload.get("image") or payload.get("frame")
     trip_id = payload.get("trip_id", "")
+    driver_id = _get_driver_id_from_trip(trip_id)
     
     if image_data:
-        # OpenCV-based detection
+        # OpenCV-based detection with personalized thresholds
         image = _decode_image(image_data)
         if image is not None:
             cv_metrics = _process_frame_with_opencv(image)
-            detection_result = _detect_from_opencv_metrics(cv_metrics)
+            
+            # Get personalized thresholds for this driver
+            thresholds = _get_cached_thresholds(driver_id)
+            
+            # Detect using personalized thresholds
+            detection_result = _detect_from_opencv_metrics(cv_metrics, thresholds)
+            
+            # Send calibration update to backend (during calibration phase)
+            _send_calibration_update(driver_id, cv_metrics)
             
             # Add SOS gesture detection
             sos_result = _detect_sos_gesture(image, trip_id)
             
-            # Add raw scores for risk computation
+            # Add raw scores for risk computation (using personalized thresholds)
+            ear_thresh = thresholds.get("ear_drowsiness", EYE_AR_THRESH)
+            mar_thresh = thresholds.get("mar_yawning", MOUTH_AR_THRESH)
+            head_thresh = thresholds.get("head_turn", HEAD_TURN_THRESH)
+            
             detection_result["raw_scores"] = {
-                "eyes_closed_score": 1.0 - cv_metrics.get("ear", 0.3) if cv_metrics.get("ear", 0.3) < EYE_AR_THRESH else 0.0,
-                "head_off_road_score": min(1.0, abs(cv_metrics.get("yaw_angle", 0.0)) / 45.0),
-                "yawning_score": max(0.0, (cv_metrics.get("mar", 0.0) - 0.3) / 0.7)
+                "eyes_closed_score": max(0.0, 1.0 - (cv_metrics.get("ear", 0.3) / ear_thresh)) if ear_thresh > 0 and cv_metrics.get("ear", 0.3) < ear_thresh else 0.0,
+                "head_off_road_score": min(1.0, abs(cv_metrics.get("yaw_angle", 0.0)) / max(45.0, head_thresh * 1.8)),
+                "yawning_score": max(0.0, (cv_metrics.get("mar", 0.0) - 0.3) / max(0.7, mar_thresh * 1.1))
+            }
+            
+            # Add personalization metadata
+            detection_result["personalization"] = {
+                "driver_id": driver_id,
+                "thresholds_used": thresholds
             }
             
             # Add SOS data
