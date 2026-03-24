@@ -16,6 +16,7 @@ public class ConfigManager {
     private static final String TAG = "ConfigManager";
     private static final String PREFS_NAME = "ivs_config";
     private static final String KEY_BACKEND_URL = "backend_url";
+    private static final String KEY_WIFI_SSID = "wifi_ssid";
     private static final String DEFAULT_BACKEND_URL = "http://192.168.55.101:5000";
     private static final String SERVICE_TYPE = "_http._tcp.";
 
@@ -177,19 +178,54 @@ public class ConfigManager {
     }
 
     private void cacheBackendUrl(String url) {
-        prefs.edit().putString(KEY_BACKEND_URL, url).apply();
+        String ssid = getCurrentWiFiSSID();
+        prefs.edit()
+            .putString(KEY_BACKEND_URL, url)
+            .putString(KEY_WIFI_SSID, ssid)
+            .apply();
+        Log.d(TAG, "Cached URL: " + url + " on WiFi: " + ssid);
+    }
+    
+    private String getCurrentWiFiSSID() {
+        try {
+            if (wifiManager == null) {
+                return null;
+            }
+            android.net.wifi.WifiInfo wifiInfo = wifiManager.getConnectionInfo();
+            if (wifiInfo != null && wifiInfo.getNetworkId() != -1) {
+                String ssid = wifiInfo.getSSID();
+                if (ssid != null) {
+                    // Remove quotes if present
+                    ssid = ssid.replace("\"", "");
+                }
+                return ssid;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to get WiFi SSID", e);
+        }
+        return null;
     }
 
     private boolean isCachedUrlUsableOnCurrentNetwork(String cachedUrl) {
         try {
+            // Check if still on same WiFi network
+            String currentSSID = getCurrentWiFiSSID();
+            String cachedSSID = prefs.getString(KEY_WIFI_SSID, null);
+            
+            if (currentSSID != null && cachedSSID != null && !currentSSID.equals(cachedSSID)) {
+                Log.d(TAG, "WiFi changed from '" + cachedSSID + "' to '" + currentSSID + "'. Invalidating cache.");
+                return false;
+            }
+            
+            // Check subnet match
             String cachedHost = new URL(cachedUrl).getHost();
             if (cachedHost == null || cachedHost.isEmpty() || !cachedHost.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) {
-                return true;
+                return true;  // Not an IP, assume it's mDNS hostname - usable
             }
 
             String localIp = getLocalIpv4Address();
             if (localIp == null || !localIp.matches("\\d+\\.\\d+\\.\\d+\\.\\d+")) {
-                return true;
+                return true;  // Can't determine local IP, assume cached URL is OK
             }
 
             String[] cachedParts = cachedHost.split("\\.");
@@ -198,9 +234,15 @@ public class ConfigManager {
                 return true;
             }
 
-            return cachedParts[0].equals(localParts[0])
+            boolean sameSubnet = cachedParts[0].equals(localParts[0])
                     && cachedParts[1].equals(localParts[1])
                     && cachedParts[2].equals(localParts[2]);
+            
+            if (!sameSubnet) {
+                Log.d(TAG, "Cached URL " + cachedHost + " not on same subnet as " + localIp);
+            }
+            
+            return sameSubnet;
         } catch (Exception e) {
             Log.e(TAG, "Failed to validate cached URL. Using it as fallback.", e);
             return true;

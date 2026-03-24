@@ -6,6 +6,8 @@ backend/server.log
 ai_engine/.venv/
 ai_engine/__pycache__/
 ai_engine/*.log
+ai_engine/*.task
+ai_engine/face_landmarker.task
 .venv/
 venv/
 env/
@@ -92,10 +94,28 @@ backend/migrate_trips.py
 backend/check_sos_trips.py
 backend/add_ai_sos_trip.py
 backend/insert_test_sos_data.py
-backend/server.log
 
-# ===== Unused Components (Calibration is internal, not a separate page) =====
-frontend/src/pages/CalibrationPage.jsx
+# ===== New AI / Model Artifacts (Do NOT Commit) =====
+# DeepFace / face recognition / mediapipe downloaded models
+ai_engine/models/
+ai_engine/*.onnx
+ai_engine/*.h5
+ai_engine/*.pb
+ai_engine/*.tflite
+ai_engine/*.pth
+ai_engine/*.pt
+ai_engine/driver_embeddings.json
+
+# Local ML caches
+.deepface/
+.cache/torch/
+.cache/huggingface/
+
+# Generated report/map outputs and local test payloads
+backend/reports/
+backend/*.pdf
+backend/*_map.png
+payload.json
 
 # ===== Database Data (Should NOT be pushed) =====
 mongodb/

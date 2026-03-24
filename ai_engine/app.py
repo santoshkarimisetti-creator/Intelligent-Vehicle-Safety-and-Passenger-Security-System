@@ -2,6 +2,8 @@ import os
 import json
 import base64
 import time
+import tempfile
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.error import HTTPError, URLError
@@ -13,13 +15,39 @@ import numpy as np
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
+# Import landmark extraction engine (MediaPipe FaceMesh)
+from landmark_engine import get_landmark_engine
+
+# Import face recognition service (identity layer)
+from face_recognition_service import get_face_recognition_service
+
+# Structured calibration
+from calibration_engine import CalibrationPhase, get_calibration_engine
+
+# Temporal behavior detection
+from behavior_engine import get_behavior_engine
+from driver_session_manager import get_driver_session_manager
+
+# Risk scoring (separate engine)
+from risk_engine import get_risk_engine
+
+# Emotion fusion + final decision
+from emotion_engine import get_emotion_engine
+from final_decision_engine import get_final_decision_engine
+from alert_engine import get_alert_engine
+
+# Driver registration (enrollment)
+from driver_registry_service import decode_base64_image_to_bgr, get_driver_registry_service
+
 # Try to import MediaPipe for hand detection
 try:
     from mediapipe.tasks import python
     from mediapipe.tasks.python import vision
+    import mediapipe as mp_image  # Image wrapper for HandLandmarker.detect
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
+    mp_image = None  # type: ignore[assignment]
     print("MediaPipe not available. Hand gesture detection disabled.")
 
 app = Flask(__name__)
@@ -28,9 +56,7 @@ CORS(app)
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:5000")
 DEFAULT_AI_SOURCE = "ai_engine"
 
-# Initialize OpenCV Haar Cascade detectors (built-in with OpenCV)
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+# Face metrics are produced by MediaPipe FaceMesh in landmark_engine.py
 
 # SOS gesture tracking
 sos_gesture_state = {
@@ -39,45 +65,20 @@ sos_gesture_state = {
     "trip_id": None
 }
 
-# Rule-Based Risk Engine: Per-trip event counters
-trip_event_counters = {}  # {trip_id: {drowsiness_events, yawning_events, looking_away_events, overspeed_count}}
-
-def _get_trip_counters(trip_id: str) -> Dict[str, int]:
-    """Get or initialize counters for a trip."""
-    if trip_id not in trip_event_counters:
-        trip_event_counters[trip_id] = {
-            "drowsiness_events": 0,
-            "yawning_events": 0,
-            "looking_away_events": 0,
-            "overspeed_count": 0,
-            "total_frames_analyzed": 0
-        }
-    return trip_event_counters[trip_id]
-
-
-def _increment_event_counter(trip_id: str, event_type: str) -> None:
-    """Increment counter for specific event type."""
-    counters = _get_trip_counters(trip_id)
-    if event_type == "drowsiness":
-        counters["drowsiness_events"] += 1
-    elif event_type == "yawning":
-        counters["yawning_events"] += 1
-    elif event_type in ["distraction", "looking_away"]:
-        counters["looking_away_events"] += 1
-
-
-def _increment_overspeed(trip_id: str, speed: float, speed_limit: float = 80) -> None:
-    """Increment overspeed counter if speed exceeds limit."""
-    counters = _get_trip_counters(trip_id)
-    counters["total_frames_analyzed"] += 1
-    if speed > speed_limit:
-        counters["overspeed_count"] += 1
+# Passenger SOS gesture state (open palm held for longer).
+passenger_sos_gesture_state = {
+    "is_palm_open": False,
+    "palm_start_time": None,
+    "trip_id": None
+}
 
 # Simplified EAR/MAR simulation constants
-EYE_AR_THRESH = 0.25  # Below this indicates drowsiness
-MOUTH_AR_THRESH = 0.6  # Above this indicates yawning
-HEAD_TURN_THRESH = 25  # Degrees from center
+# These are used when driver has not completed calibration
+EYE_AR_THRESH = 0.20  # Below this indicates drowsiness (FaceMesh EAR range: 0.0-0.4)
+MOUTH_AR_THRESH = 0.08  # Above this indicates yawning (FaceMesh MAR range: 0.0-0.4, typically 0.03-0.10)
+HEAD_TURN_THRESH = 20  # Degrees from center
 SOS_DURATION_THRESH = 2.0  # Seconds to hold palm for SOS trigger
+PASSENGER_SOS_DURATION_THRESH = float(os.getenv("PASSENGER_SOS_DURATION_THRESH", "5.0"))
 
 # Driver personalization: Cache for thresholds (to avoid backend calls every frame)
 driver_thresholds_cache = {}  # {driver_id: {ear_drowsiness, mar_yawning, head_turn, cached_at}}
@@ -130,31 +131,167 @@ def _get_cached_thresholds(driver_id: str) -> Dict[str, float]:
         "head_turn": HEAD_TURN_THRESH
     }
 
-
-def _send_calibration_update(driver_id: str, frame_metrics: Dict[str, Any]) -> bool:
-    """Send frame metrics to backend for calibration collection."""
-    try:
-        payload = {
-            "metrics": frame_metrics
-        }
-        
-        endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/drivers/{driver_id}/calibration/update"
-        body = json.dumps(payload).encode("utf-8")
-        req = Request(
-            endpoint,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        
-        with urlopen(req, timeout=2) as response:
-            return 200 <= response.status < 300
-    except Exception as e:
-        print(f"Warning: Could not send calibration update: {e}")
-        return False
-
 # MediaPipe Hand Landmarker (lazy initialization)
 hand_landmarker = None
+hand_landmarker_init_attempted = False  # Flag to avoid repeated warnings
+
+# MediaPipe Pose Landmarker (lazy initialization) for crossed-arms SOS gesture
+pose_landmarker = None
+pose_landmarker_init_attempted = False
+
+
+def _ensure_hand_landmarker_model_path() -> Optional[str]:
+    """Resolve `hand_landmarker.task` (repo-local, cache, or download)."""
+    local_path = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+    if os.path.exists(local_path):
+        return local_path
+    cache_path = os.path.join(tempfile.gettempdir(), "hand_landmarker.task")
+    if os.path.exists(cache_path):
+        return cache_path
+    try:
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+            "hand_landmarker/float16/1/hand_landmarker.task"
+        )
+        print(f"Downloading hand landmarker model to {cache_path}...")
+        urllib.request.urlretrieve(url, cache_path)
+        return cache_path
+    except Exception as e:
+        print(f"⚠ Could not download hand landmarker model: {e}")
+        return None
+
+
+def _ensure_pose_landmarker_model_path() -> Optional[str]:
+    """Resolve `pose_landmarker_full.task` (repo-local, cache, or download)."""
+    local_path = os.path.join(os.path.dirname(__file__), "pose_landmarker_full.task")
+    if os.path.exists(local_path):
+        return local_path
+    cache_path = os.path.join(tempfile.gettempdir(), "pose_landmarker_full.task")
+    if os.path.exists(cache_path):
+        return cache_path
+    try:
+        url = (
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+            "pose_landmarker_full/float16/1/pose_landmarker_full.task"
+        )
+        print(f"Downloading pose landmarker model to {cache_path}...")
+        urllib.request.urlretrieve(url, cache_path)
+        return cache_path
+    except Exception as e:
+        print(f"⚠ Could not download pose landmarker model: {e}")
+        return None
+
+
+def _get_pose_landmarker():
+    """Lazy init pose landmarker; returns None if MediaPipe unavailable."""
+    global pose_landmarker, pose_landmarker_init_attempted
+    if not MEDIAPIPE_AVAILABLE:
+        return None
+    if pose_landmarker_init_attempted:
+        return pose_landmarker
+    pose_landmarker_init_attempted = True
+    try:
+        model_path = _ensure_pose_landmarker_model_path()
+        if not model_path:
+            print("⚠ MediaPipe Pose: model path unavailable (cross-arms SOS disabled)")
+            return None
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.PoseLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            num_poses=2,
+            min_pose_detection_confidence=0.45,
+            min_pose_presence_confidence=0.45,
+            min_tracking_confidence=0.45,
+        )
+        pose_landmarker = vision.PoseLandmarker.create_from_options(options)
+        print("✓ MediaPipe Pose initialized successfully")
+        return pose_landmarker
+    except Exception as e:
+        print(f"⚠ Warning: Could not create PoseLandmarker: {e}")
+        return None
+
+
+def _bbox_array_to_dict(bbox: Any) -> Optional[Dict[str, int]]:
+    if isinstance(bbox, dict) and all(k in bbox for k in ("x", "y", "w", "h")):
+        return {"x": int(bbox["x"]), "y": int(bbox["y"]), "w": int(bbox["w"]), "h": int(bbox["h"])}
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        return {"x": int(bbox[0]), "y": int(bbox[1]), "w": int(bbox[2]), "h": int(bbox[3])}
+    return None
+
+
+def _wrist_in_expanded_bbox(
+    wrist_nx: float,
+    wrist_ny: float,
+    bbox: Dict[str, int],
+    iw: int,
+    ih: int,
+    margin: float = 0.55,
+) -> bool:
+    """Normalized wrist (0..1) inside face bbox expanded for arm reach."""
+    cx = wrist_nx * float(iw)
+    cy = wrist_ny * float(ih)
+    bx, by, bw, bh = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
+    mx, my = float(bw) * margin, float(bh) * margin
+    return (bx - mx) <= cx <= (bx + bw + mx) and (by - my) <= cy <= (by + bh + my)
+
+
+def _norm_dist(a, b) -> float:
+    try:
+        dx = float(a.x) - float(b.x)
+        dy = float(a.y) - float(b.y)
+        return float((dx * dx + dy * dy) ** 0.5)
+    except Exception:
+        return 9e9
+
+
+def _detect_crossed_arms_info(image: np.ndarray) -> Dict[str, Any]:
+    """Detect crossed arms (X) using pose landmarks (wrist near opposite shoulder)."""
+    landmarker = _get_pose_landmarker()
+    if landmarker is None:
+        return {"crossed": False, "error": None, "message": "MediaPipe Pose not available"}
+    if image is None or image.size == 0:
+        return {"crossed": False, "error": None, "message": None}
+
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    try:
+        if mp_image is None:
+            raise RuntimeError("mediapipe Image not available")
+        mp_img = mp_image.Image(image_format=mp_image.ImageFormat.SRGB, data=rgb)
+        results = landmarker.detect(mp_img)
+    except Exception as e:
+        return {"crossed": False, "error": str(e), "message": "Pose detection error"}
+
+    if not results.pose_landmarks:
+        return {"crossed": False, "error": None, "message": None}
+
+    # Use the most confident pose (first).
+    lm = results.pose_landmarks[0]
+    if len(lm) < 13:
+        return {"crossed": False, "error": None, "message": None}
+
+    # MediaPipe pose landmark indices: 11 L-shoulder, 12 R-shoulder, 15 L-wrist, 16 R-wrist
+    l_sh, r_sh = lm[11], lm[12]
+    l_wr, r_wr = lm[15], lm[16]
+
+    d_lwr_rsh = _norm_dist(l_wr, r_sh)
+    d_rwr_lsh = _norm_dist(r_wr, l_sh)
+    d_lsh_rsh = _norm_dist(l_sh, r_sh)
+    if not (d_lsh_rsh > 0 and d_lsh_rsh < 2.0):
+        return {"crossed": False, "error": None, "message": None}
+
+    # Require both wrists close to opposite shoulder relative to shoulder width.
+    ratio_l = d_lwr_rsh / d_lsh_rsh
+    ratio_r = d_rwr_lsh / d_lsh_rsh
+
+    thr = float(os.getenv("CROSS_ARMS_RATIO_THRESH", "0.55"))
+    crossed = (ratio_l <= thr) and (ratio_r <= thr)
+    return {
+        "crossed": bool(crossed),
+        "ratios": {"left_wrist_to_right_shoulder": round(ratio_l, 3), "right_wrist_to_left_shoulder": round(ratio_r, 3)},
+        "error": None,
+        "message": None,
+    }
 
 
 def _euclidean_distance(p1: np.ndarray, p2: np.ndarray) -> float:
@@ -167,33 +304,36 @@ def _get_hand_landmarker():
     Lazy initialization of hand landmarker.
     Returns None if MediaPipe is not available.
     """
-    global hand_landmarker
+    global hand_landmarker, hand_landmarker_init_attempted
     
     if not MEDIAPIPE_AVAILABLE:
         return None
     
+    # Return cached result (success or failure)
+    if hand_landmarker_init_attempted:
+        return hand_landmarker
+    
+    hand_landmarker_init_attempted = True
+    
     if hand_landmarker is None:
         try:
-            # MediaPipe Hand Landmarker can work without explicit model file in newer versions
-            # It uses built-in model
-            base_options = python.BaseOptions(model_asset_path='')
+            model_path = _ensure_hand_landmarker_model_path()
+            if not model_path:
+                print("⚠ MediaPipe Hands: model path unavailable (SOS gesture detection disabled)")
+                return None
+            base_options = python.BaseOptions(model_asset_path=model_path)
             options = vision.HandLandmarkerOptions(
                 base_options=base_options,
                 running_mode=vision.RunningMode.IMAGE,
-                num_hands=2,
-                min_hand_detection_confidence=0.5,
-                min_hand_presence_confidence=0.5,
-                min_tracking_confidence=0.5
+                num_hands=4,
+                min_hand_detection_confidence=0.42,
+                min_hand_presence_confidence=0.42,
+                min_tracking_confidence=0.42,
             )
-            # Try to create without model file (uses built-in)
-            try:
-                hand_landmarker = vision.HandLandmarker.create_from_options(options)
-            except:
-                # If fails, MediaPipe hands not fully configured
-                print("MediaPipe Hands: Model file required but not configured")
-                return None
+            hand_landmarker = vision.HandLandmarker.create_from_options(options)
+            print("✓ MediaPipe Hands initialized successfully")
         except Exception as e:
-            print(f"Warning: Could not create HandLandmarker: {e}")
+            print(f"⚠ Warning: Could not create HandLandmarker: {e}")
             return None
     
     return hand_landmarker
@@ -239,98 +379,244 @@ def _is_palm_open(hand_landmarks) -> bool:
     return fingers_extended >= 3 and thumb_extended
 
 
-def _detect_sos_gesture(image: np.ndarray, trip_id: str) -> Dict[str, Any]:
+def _detect_sos_gesture(
+    image: np.ndarray,
+    trip_id: str,
+    palm_open_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Detect SOS hand gesture (open palm held for > 2 seconds).
     Returns: {sos_detected, sos_triggered, palm_open, duration}
     """
     global sos_gesture_state
-    
-    landmarker = _get_hand_landmarker()
-    
-    if landmarker is None:
-        # MediaPipe not available, return no SOS
+
+    # This function only uses the driver/any SOS timer.
+    # Passenger SOS uses a separate state and is implemented in `_detect_passenger_sos_gesture`.
+    if palm_open_info is None:
+        palm_open_info = _detect_palm_open_info(image)
+    if "error" in palm_open_info and palm_open_info["error"]:
         return {
+            "type": "sos_gesture",
+            "person": "driver",
             "sos_detected": False,
             "sos_triggered": False,
             "palm_open": False,
             "duration": 0.0,
-            "message": "MediaPipe Hands not available"
+            "message": palm_open_info.get("message", "MediaPipe Hands not available"),
+            "error": palm_open_info.get("error"),
         }
-    
-    if image is None or image.size == 0:
-        return {
-            "sos_detected": False,
-            "sos_triggered": False,
-            "palm_open": False,
-            "duration": 0.0
-        }
-    
-    # Convert BGR to RGB
-    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    
-    # Create MediaPipe Image
-    try:
-        mp_image = python.vision.Image(
-            image_format=python.vision.ImageFormat.SRGB,
-            data=rgb_image
-        )
-        
-        # Detect hands
-        results = landmarker.detect(mp_image)
-    except Exception as e:
-        print(f"Hand detection error: {e}")
-        return {
-            "sos_detected": False,
-            "sos_triggered": False,
-            "palm_open": False,
-            "duration": 0.0,
-            "error": str(e)
-        }
-    
+
+    palm_signal = bool(
+        palm_open_info.get("driver_palm_effective", palm_open_info.get("palm_open", False))
+    )
+    hands_detected = int(palm_open_info.get("hands_detected", 0))
+
     current_time = time.time()
-    palm_open = False
-    
-    # Check if any hand has open palm
-    if results.hand_landmarks:
-        for hand_landmarks in results.hand_landmarks:
-            if _is_palm_open(hand_landmarks):
-                palm_open = True
-                break
-    
-    # Update gesture state
-    if palm_open:
+
+    if palm_signal:
         if not sos_gesture_state["is_palm_open"] or sos_gesture_state["trip_id"] != trip_id:
-            # Palm just opened or new trip
             sos_gesture_state["is_palm_open"] = True
             sos_gesture_state["palm_start_time"] = current_time
             sos_gesture_state["trip_id"] = trip_id
-        
-        # Calculate duration
+
         duration = current_time - sos_gesture_state["palm_start_time"]
-        
-        # Check if SOS should be triggered
         sos_triggered = duration >= SOS_DURATION_THRESH
-        
         return {
+            "type": "sos_gesture",
+            "person": "driver",
             "sos_detected": True,
             "sos_triggered": sos_triggered,
             "palm_open": True,
             "duration": round(duration, 2),
-            "hands_detected": len(results.hand_landmarks) if results.hand_landmarks else 0
+            "hands_detected": hands_detected,
         }
-    else:
-        # Reset state if palm is not open
-        sos_gesture_state["is_palm_open"] = False
-        sos_gesture_state["palm_start_time"] = None
-        
+
+    # Reset state if palm is not open
+    sos_gesture_state["is_palm_open"] = False
+    sos_gesture_state["palm_start_time"] = None
+    return {
+        "type": "sos_gesture",
+        "person": "driver",
+        "sos_detected": False,
+        "sos_triggered": False,
+        "palm_open": False,
+        "duration": 0.0,
+        "hands_detected": hands_detected,
+    }
+
+
+def _detect_palm_open_info(
+    image: np.ndarray,
+    driver_bbox: Optional[Dict[str, int]] = None,
+    passenger_bboxes: Optional[List[Dict[str, int]]] = None,
+) -> Dict[str, Any]:
+    """
+    Detect open palm(s) with MediaPipe Hands and optional spatial attribution
+    to driver vs passenger face regions (for separate SOS timers).
+    """
+    landmarker = _get_hand_landmarker()
+    if landmarker is None:
         return {
+            "palm_open": False,
+            "driver_palm_open": False,
+            "passenger_palm_open": False,
+            "driver_palm_effective": False,
+            "passenger_palm_effective": False,
+            "hands_detected": 0,
+            "error": None,
+            "message": "MediaPipe Hands not available",
+        }
+
+    if image is None or image.size == 0:
+        return {
+            "palm_open": False,
+            "driver_palm_open": False,
+            "passenger_palm_open": False,
+            "driver_palm_effective": False,
+            "passenger_palm_effective": False,
+            "hands_detected": 0,
+            "error": None,
+            "message": None,
+        }
+
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    ih, iw = rgb_image.shape[:2]
+    try:
+        if mp_image is None:
+            raise RuntimeError("mediapipe Image not available")
+        mp_img = mp_image.Image(image_format=mp_image.ImageFormat.SRGB, data=rgb_image)
+        results = landmarker.detect(mp_img)
+    except Exception as e:
+        return {
+            "palm_open": False,
+            "driver_palm_open": False,
+            "passenger_palm_open": False,
+            "driver_palm_effective": False,
+            "passenger_palm_effective": False,
+            "hands_detected": 0,
+            "error": str(e),
+            "message": "Hand detection error",
+        }
+
+    palm_open = False
+    driver_palm_open = False
+    passenger_palm_open = False
+    hands_detected = len(results.hand_landmarks) if results.hand_landmarks else 0
+    pboxes = passenger_bboxes or []
+
+    if results.hand_landmarks:
+        for hand_landmarks in results.hand_landmarks:
+            if not _is_palm_open(hand_landmarks):
+                continue
+            palm_open = True
+            wrist = hand_landmarks[0]
+            wx, wy = float(wrist.x), float(wrist.y)
+            if driver_bbox and _wrist_in_expanded_bbox(wx, wy, driver_bbox, iw, ih):
+                driver_palm_open = True
+            for pb in pboxes:
+                if _wrist_in_expanded_bbox(wx, wy, pb, iw, ih):
+                    passenger_palm_open = True
+                    break
+
+    has_passengers = len(pboxes) > 0
+    driver_palm_effective = bool(driver_palm_open or (not has_passengers and palm_open))
+    passenger_palm_effective = bool(has_passengers and passenger_palm_open)
+
+    return {
+        "palm_open": palm_open,
+        "driver_palm_open": driver_palm_open,
+        "passenger_palm_open": passenger_palm_open,
+        "driver_palm_effective": driver_palm_effective,
+        "passenger_palm_effective": passenger_palm_effective,
+        "hands_detected": hands_detected,
+        "error": None,
+        "message": None,
+    }
+
+
+def _detect_passenger_sos_gesture(
+    image: np.ndarray,
+    trip_id: str,
+    has_passengers: bool,
+    palm_open_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Passenger SOS gesture:
+    - trigger when crossed arms (X) persists for 3–5 seconds
+    - reset immediately when palm disappears
+    - only evaluated when `has_passengers` is True
+    """
+    global passenger_sos_gesture_state
+
+    if not has_passengers:
+        # Reset passenger SOS state if no passengers.
+        passenger_sos_gesture_state["is_palm_open"] = False
+        passenger_sos_gesture_state["palm_start_time"] = None
+        passenger_sos_gesture_state["trip_id"] = None
+        return {
+            "type": "sos_gesture",
+            "person": "passenger",
             "sos_detected": False,
             "sos_triggered": False,
-            "palm_open": False,
+            "crossed_arms": False,
             "duration": 0.0,
-            "hands_detected": len(results.hand_landmarks) if results.hand_landmarks else 0
+            "hands_detected": 0,
         }
+
+    crossed_info = _detect_crossed_arms_info(image)
+    if crossed_info.get("error"):
+        return {
+            "type": "sos_gesture",
+            "person": "passenger",
+            "sos_detected": False,
+            "sos_triggered": False,
+            "crossed_arms": False,
+            "duration": 0.0,
+            "hands_detected": 0,
+            "message": crossed_info.get("message"),
+        }
+
+    crossed = bool(crossed_info.get("crossed", False))
+    hands_detected = 0
+
+    current_time = time.time()
+
+    if crossed:
+        if (
+            not passenger_sos_gesture_state["is_palm_open"]
+            or passenger_sos_gesture_state["trip_id"] != trip_id
+        ):
+            passenger_sos_gesture_state["is_palm_open"] = True
+            passenger_sos_gesture_state["palm_start_time"] = current_time
+            passenger_sos_gesture_state["trip_id"] = trip_id
+
+        duration = current_time - passenger_sos_gesture_state["palm_start_time"]
+        gesture_s = float(os.getenv("CROSS_ARMS_SOS_DURATION_S", "4.0"))
+        sos_triggered = duration >= gesture_s
+        return {
+            "type": "sos_gesture",
+            "person": "passenger",
+            "sos_detected": True,
+            "sos_triggered": sos_triggered,
+            "crossed_arms": True,
+            "duration": round(duration, 2),
+            "hands_detected": hands_detected,
+            "ratios": crossed_info.get("ratios"),
+        }
+
+    # Reset state if palm is not open
+    passenger_sos_gesture_state["is_palm_open"] = False
+    passenger_sos_gesture_state["palm_start_time"] = None
+    passenger_sos_gesture_state["trip_id"] = None
+    return {
+        "type": "sos_gesture",
+        "person": "passenger",
+        "sos_detected": False,
+        "sos_triggered": False,
+        "crossed_arms": False,
+        "duration": 0.0,
+        "hands_detected": hands_detected,
+    }
 
 
 def _decode_image(image_data: str) -> Optional[np.ndarray]:
@@ -356,140 +642,17 @@ def _decode_image(image_data: str) -> Optional[np.ndarray]:
         return None
 
 
-def _estimate_ear_from_eyes(gray_face, eyes) -> float:
+def _process_frame_with_landmarks(image: np.ndarray) -> Dict[str, Any]:
+    """Extract face metrics from an image frame.
+
+    All landmark/vision computation is delegated to `ai_engine.landmark_engine`.
+    This wrapper exists to keep the rest of the API code stable.
     """
-    Estimate EAR (Eye Aspect Ratio) from detected eyes.
-    Uses simplified heuristic based on eye region analysis.
-    """
-    if len(eyes) < 2:
-        return 0.3  # Default open eyes value
-    
-    # Analyze eye regions for closure
-    ear_values = []
-    for (ex, ey, ew, eh) in eyes:
-        eye_region = gray_face[ey:ey+eh, ex:ex+ew]
-        if eye_region.size == 0:
-            continue
-        
-        # Calculate vertical to horizontal ratio
-        # Closed eyes have lower ratio
-        vertical_profile = np.mean(eye_region, axis=1)
-        if len(vertical_profile) == 0:
-            continue
-        
-        # Simple closure detection: measure intensity variation
-        intensity_var = np.var(vertical_profile)
-        
-        # Normalize to EAR-like scale (higher var = more open)
-        # Typical range: closed ~0.1-0.2, open ~0.25-0.35
-        estimated_ear = min(0.35, max(0.1, intensity_var / 1000.0 + 0.15))
-        ear_values.append(estimated_ear)
-    
-    return float(np.mean(ear_values)) if ear_values else 0.3
+    landmark_engine = get_landmark_engine()
+    return landmark_engine.process_frame(image)
 
 
-def _estimate_mar_from_face(gray_face, face_height) -> float:
-    """
-    Estimate MAR (Mouth Aspect Ratio) from lower face region.
-    Uses simplified heuristic based on mouth region analysis.
-    """
-    # Focus on lower 40% of face for mouth region
-    mouth_region_start = int(face_height * 0.6)
-    mouth_region = gray_face[mouth_region_start:, :]
-    
-    if mouth_region.size == 0:
-        return 0.3  # Default closed mouth
-    
-    # Analyze vertical intensity profile in mouth region
-    vertical_profile = np.mean(mouth_region, axis=1)
-    
-    # Detect dark region (open mouth) by finding intensity drops
-    if len(vertical_profile) < 3:
-        return 0.3
-    
-    intensity_diff = np.max(vertical_profile) - np.min(vertical_profile)
-    
-    # Normalize to MAR-like scale
-    # Typical range: closed ~0.2-0.4, yawning ~0.6-1.0
-    estimated_mar = min(1.0, max(0.2, intensity_diff / 100.0))
-    
-    return float(estimated_mar)
-
-
-def _estimate_head_yaw(face_x, face_w, image_width) -> float:
-    """
-    Estimate head yaw angle (looking away) based on face position.
-    Simplified approach using face center deviation from image center.
-    """
-    face_center_x = face_x + face_w / 2
-    image_center_x = image_width / 2
-    
-    # Calculate deviation as percentage
-    deviation = (face_center_x - image_center_x) / (image_width / 2)
-    
-    # Convert to approximate yaw angle (-45 to +45 degrees)
-    yaw_angle = deviation * 45.0
-    
-    return float(yaw_angle)
-
-
-def _process_frame_with_opencv(image: np.ndarray) -> Dict[str, Any]:
-    """
-    Process frame with OpenCV Haar Cascades and estimate metrics.
-    Returns: {ear, mar, yaw_angle, face_detected}
-    """
-    if image is None or image.size == 0:
-        return {
-            "face_detected": False,
-            "landmarks_detected": False,
-            "ear": 0.0,
-            "mar": 0.0,
-            "yaw_angle": 0.0
-        }
-    
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    height, width = gray.shape
-    
-    # Detect faces
-    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
-    
-    if len(faces) == 0:
-        return {
-            "face_detected": False,
-            "landmarks_detected": False,
-            "ear": 0.0,
-            "mar": 0.0,
-            "yaw_angle": 0.0
-        }
-    
-    # Use first detected face
-    (x, y, w, h) = faces[0]
-    face_gray = gray[y:y+h, x:x+w]
-    
-    # Detect eyes in face region
-    eyes = eye_cascade.detectMultiScale(face_gray, 1.1, 5)
-    
-    # Estimate EAR from detected eyes
-    ear = _estimate_ear_from_eyes(face_gray, eyes)
-    
-    # Estimate MAR from face region
-    mar = _estimate_mar_from_face(face_gray, h)
-    
-    # Estimate head yaw
-    yaw_angle = _estimate_head_yaw(x, w, width)
-    
-    return {
-        "face_detected": True,
-        "landmarks_detected": True,
-        "ear": round(ear, 3),
-        "mar": round(mar, 3),
-        "yaw_angle": round(yaw_angle, 2),
-        "eyes_detected": len(eyes)
-    }
-
-
-def _detect_from_opencv_metrics(metrics: Dict[str, Any], thresholds: Dict[str, float] = None) -> Dict[str, Any]:
+def _detect_from_landmark_metrics(metrics: Dict[str, Any], thresholds: Dict[str, float] = None) -> Dict[str, Any]:
     """
     Detect drowsiness, yawning, and looking away from OpenCV metrics.
     
@@ -530,7 +693,7 @@ def _detect_from_opencv_metrics(metrics: Dict[str, Any], thresholds: Dict[str, f
         detections.append({
             "type": "drowsiness",
             "confidence": round(min(1.0, max(0.0, confidence)), 3),
-            "source": "opencv_haar",
+            "source": "mediapipe_facemesh",
             "metric": "ear",
             "value": ear,
             "threshold": ear_thresh
@@ -542,7 +705,7 @@ def _detect_from_opencv_metrics(metrics: Dict[str, Any], thresholds: Dict[str, f
         detections.append({
             "type": "yawning",
             "confidence": round(min(1.0, max(0.0, confidence)), 3),
-            "source": "opencv_haar",
+            "source": "mediapipe_facemesh",
             "metric": "mar",
             "value": mar,
             "threshold": mar_thresh
@@ -554,7 +717,7 @@ def _detect_from_opencv_metrics(metrics: Dict[str, Any], thresholds: Dict[str, f
         detections.append({
             "type": "distraction",
             "confidence": round(min(1.0, max(0.0, confidence)), 3),
-            "source": "opencv_haar",
+            "source": "mediapipe_facemesh",
             "metric": "yaw_angle",
             "value": yaw_angle,
             "threshold": head_thresh
@@ -576,51 +739,145 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Compute detections from either:
-    1. Base64 image data (uses OpenCV with Haar Cascades + personalized thresholds)
+    1. Base64 image data (uses MediaPipe FaceMesh landmarks + personalized thresholds)
     2. Pre-computed signal scores (legacy mode)
     """
     # Check if image data is provided
     image_data = payload.get("image") or payload.get("frame")
     trip_id = payload.get("trip_id", "")
-    driver_id = _get_driver_id_from_trip(trip_id)
+    fallback_driver_id = _get_driver_id_from_trip(trip_id)
+    session_key = trip_id or f"driver:{fallback_driver_id}"
     
     if image_data:
-        # OpenCV-based detection with personalized thresholds
+        # Landmark-based detection with personalized thresholds
         image = _decode_image(image_data)
         if image is not None:
-            cv_metrics = _process_frame_with_opencv(image)
-            
-            # Get personalized thresholds for this driver
-            thresholds = _get_cached_thresholds(driver_id)
-            
-            # Detect using personalized thresholds
-            detection_result = _detect_from_opencv_metrics(cv_metrics, thresholds)
-            
-            # Send calibration update to backend (during calibration phase)
-            _send_calibration_update(driver_id, cv_metrics)
-            
-            # Add SOS gesture detection
-            sos_result = _detect_sos_gesture(image, trip_id)
-            
-            # Add raw scores for risk computation (using personalized thresholds)
-            ear_thresh = thresholds.get("ear_drowsiness", EYE_AR_THRESH)
-            mar_thresh = thresholds.get("mar_yawning", MOUTH_AR_THRESH)
-            head_thresh = thresholds.get("head_turn", HEAD_TURN_THRESH)
-            
-            detection_result["raw_scores"] = {
-                "eyes_closed_score": max(0.0, 1.0 - (cv_metrics.get("ear", 0.3) / ear_thresh)) if ear_thresh > 0 and cv_metrics.get("ear", 0.3) < ear_thresh else 0.0,
-                "head_off_road_score": min(1.0, abs(cv_metrics.get("yaw_angle", 0.0)) / max(45.0, head_thresh * 1.8)),
-                "yawning_score": max(0.0, (cv_metrics.get("mar", 0.0) - 0.3) / max(0.7, mar_thresh * 1.1))
+            cv_metrics = _process_frame_with_landmarks(image)
+
+            # Identity layer (can inform session lock)
+            identity_service = get_face_recognition_service()
+            identity = identity_service.identify_driver(
+                image_bgr=image,
+                target_face_bbox=cv_metrics.get("face_bbox"),
+            )
+
+            # Session management: lock identity per trip/session
+            session_mgr = get_driver_session_manager()
+            sess, driver_changed, previous_driver = session_mgr.observe_identity(
+                session_key=session_key,
+                fallback_driver_id=fallback_driver_id,
+                identity_driver_id=identity.driver_id,
+                identity_confidence=float(identity.confidence),
+                identity_matched=bool(identity.matched),
+            )
+
+            active_driver_id = sess.active_driver_id
+
+            # Load thresholds for the active driver (session-cached)
+            thresholds = session_mgr.get_thresholds(
+                session_key=session_key,
+                driver_id=active_driver_id,
+            )
+
+            # If driver changed (e.g., first lock), reset temporal behavior state for the previous driver
+            if driver_changed and previous_driver:
+                try:
+                    get_behavior_engine().reset_driver(driver_id=previous_driver)
+                except Exception:
+                    pass
+
+            # Temporal behavior detection (stateful) keyed by ACTIVE driver id
+            behavior = get_behavior_engine().update(
+                driver_id=active_driver_id,
+                cv_metrics=cv_metrics,
+                thresholds=thresholds,
+            )
+            detection_result = {
+                "detections": behavior.get("detections", []),
+                "metrics": cv_metrics,
             }
+
+            # Multi-person monitoring output:
+            # `landmark_engine` provides `faces_meta` with per-face roles.
+            faces_meta = cv_metrics.get("faces_meta", []) or []
+            driver_meta = next((m for m in faces_meta if m.get("role") == "driver"), None)
+            passenger_meta = [m for m in faces_meta if m.get("role") == "passenger"]
+            detection_result["driver"] = driver_meta
+            detection_result["passengers"] = passenger_meta
+            detection_result["identity"] = {
+                "driver_id": identity.driver_id,
+                "confidence": round(float(identity.confidence), 3),
+                "matched": bool(identity.matched),
+            }
+
+            detection_result["session"] = session_mgr.export_session(session_key=session_key)
+
+            # Emotion detection (support signal, not a primary trigger).
+            # Only run in image-mode (we have an actual frame to analyze/crop).
+            emotion_engine = get_emotion_engine()
+            emotion_result = emotion_engine.predict_emotion(
+                image_bgr=image,
+                face_bbox=cv_metrics.get("face_bbox"),
+            )
+            detection_result["emotion"] = emotion_result
+
+            # Append emotion detection to the end so primary fatigue/distraction labels remain first.
+            emotion_risk = float(emotion_result.get("emotion_risk_score") or 0.0)
+            emotion_min_risk = float(os.getenv("EMOTION_MIN_RISK_FOR_DETECTION", "0.35"))
+            if emotion_risk >= emotion_min_risk:
+                dominant = str(emotion_result.get("dominant_emotion") or "unknown")
+                detection_result["detections"].append({
+                    "type": f"emotion_{dominant}",
+                    "confidence": round(float(emotion_result.get("confidence") or 0.0), 3),
+                    "source": "deepface",
+                })
+
+            # Optional: structured calibration sample submission via analyze_frame
+            # (preferred flow is via /drivers/<id>/calibration/* endpoints)
+            calibration_phase = payload.get("calibration_phase")
+            if calibration_phase:
+                try:
+                    phase = CalibrationPhase(str(calibration_phase))
+                    calib_progress = get_calibration_engine().add_metrics(
+                        driver_id=active_driver_id,
+                        metrics=cv_metrics,
+                        phase=phase,
+                        auto_advance=bool(payload.get("calibration_auto_advance", True)),
+                    )
+                    detection_result["calibration"] = {
+                        "driver_id": active_driver_id,
+                        "phase": calib_progress.current_phase.value,
+                        "frames_collected": calib_progress.frames_collected,
+                        "frames_needed": calib_progress.frames_needed,
+                        "is_complete": calib_progress.is_complete,
+                    }
+                except Exception as e:
+                    detection_result["calibration"] = {"error": str(e)}
+            
+            # Passenger SOS gesture (crossed arms X) only when passengers exist.
+            has_passengers = len(passenger_meta) > 0
+            passenger_sos_result = _detect_passenger_sos_gesture(
+                image,
+                trip_id,
+                has_passengers=has_passengers,
+                palm_open_info=None,
+            )
+            
+            # Add raw scores for risk computation (temporal & threshold-based)
+            detection_result["raw_scores"] = behavior.get("raw_scores", {
+                "eyes_closed_score": 0.0,
+                "head_off_road_score": 0.0,
+                "yawning_score": 0.0,
+            })
             
             # Add personalization metadata
             detection_result["personalization"] = {
-                "driver_id": driver_id,
-                "thresholds_used": thresholds
+                "driver_id": active_driver_id,
+                "thresholds_used": thresholds,
+                "identity_locked": bool(sess.locked),
             }
             
-            # Add SOS data
-            detection_result["sos_gesture"] = sos_result
+            detection_result["sos_gesture"] = passenger_sos_result
             
             return detection_result
         else:
@@ -644,9 +901,25 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
     signal = payload.get("signal", {}) or {}
     metrics = payload.get("metrics", {}) or {}
 
-    eyes_closed_score = _to_float(signal.get("eyes_closed_score", metrics.get("eyes_closed_score", 0.0)))
-    head_off_road_score = _to_float(signal.get("head_off_road_score", metrics.get("head_off_road_score", 0.0)))
-    yawning_score = _to_float(signal.get("yawning_score", metrics.get("yawning_score", 0.0)))
+    # Legacy compatibility:
+    # - tests and older clients often send boolean flags:
+    #   {drowsiness: bool, yawning: bool, distraction: bool}
+    # - while current implementation expects numeric signal/metrics scores.
+    has_numeric_scores = (
+        any(k in signal for k in ["eyes_closed_score", "head_off_road_score", "yawning_score"])
+        or any(k in metrics for k in ["eyes_closed_score", "head_off_road_score", "yawning_score"])
+    )
+
+    if not has_numeric_scores and any(
+        bool(payload.get(k, False)) for k in ["drowsiness", "yawning", "distraction"]
+    ):
+        eyes_closed_score = 1.0 if bool(payload.get("drowsiness", False)) else 0.0
+        head_off_road_score = 1.0 if bool(payload.get("distraction", False)) else 0.0
+        yawning_score = 1.0 if bool(payload.get("yawning", False)) else 0.0
+    else:
+        eyes_closed_score = _to_float(signal.get("eyes_closed_score", metrics.get("eyes_closed_score", 0.0)))
+        head_off_road_score = _to_float(signal.get("head_off_road_score", metrics.get("head_off_road_score", 0.0)))
+        yawning_score = _to_float(signal.get("yawning_score", metrics.get("yawning_score", 0.0)))
 
     detections: List[Dict[str, Any]] = []
 
@@ -666,7 +939,7 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if yawning_score >= 0.55:
         detections.append({
-            "type": "fatigue_yawn",
+            "type": "yawning",
             "confidence": round(min(1.0, yawning_score), 3),
             "source": DEFAULT_AI_SOURCE,
         })
@@ -688,197 +961,34 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _risk_level(score: float) -> str:
-    if score >= 80:
-        return "CRITICAL"
-    if score >= 60:
-        return "HIGH"
-    if score >= 35:
-        return "MEDIUM"
-    return "LOW"
-
-
-def _risk_level_weighted(score: float) -> str:
-    """Classify weighted risk score to safety level."""
-    if score >= 76:
-        return "CRITICAL"
-    if score >= 51:
-        return "HIGH"
-    if score >= 21:
-        return "MODERATE"
-    return "SAFE"
-
-
-def _compute_weighted_risk(detection_result: Dict[str, Any], metrics: Dict[str, Any] = None) -> Dict[str, Any]:
-    """Compute composite weighted risk score (Task 7).
-    
-    Weights based on driver safety research:
-    - Overspeed (w1):    0.25  (speed danger)
-    - Drowsiness (w2):   0.30  (fatigue danger)
-    - Distraction (w3):  0.35  (most dangerous - eyes off road)
-    - Yawning (w4):      0.10  (often recovers quickly)
-    
-    Score range: 0-100
-    Risk levels:
-    - SAFE (0-20):      Safe driving
-    - MODERATE (21-50): Caution advised
-    - HIGH (51-75):     Dangerous behavior
-    - CRITICAL (76-100): Immediate intervention needed
-    """
-    if metrics is None:
-        metrics = {}
-    
-    # Extract detection scores (0-1 normalized)
-    raw_scores = detection_result.get("raw_scores", {})
-    eyes_closed_score = max(0.0, min(1.0, float(raw_scores.get("eyes_closed_score", 0) or 0)))
-    head_off_road_score = max(0.0, min(1.0, float(raw_scores.get("head_off_road_score", 0) or 0)))
-    yawning_score = max(0.0, min(1.0, float(raw_scores.get("yawning_score", 0) or 0)))
-    
-    # Speed component (normalize to 0-1: 0 at 0 km/h, 1 at 120+ km/h)
-    speed = max(0.0, float(metrics.get("speed", 0) or 0))
-    speed_normalized = min(1.0, speed / 120.0)
-    
-    # Weighted formula
-    w1 = 0.25  # overspeed weight
-    w2 = 0.30  # drowsiness weight
-    w3 = 0.35  # distraction weight
-    w4 = 0.10  # yawning weight
-    
-    # Compose weighted score (0-100 scale)
-    weighted_score = (
-        w1 * speed_normalized * 100.0 +
-        w2 * eyes_closed_score * 100.0 +
-        w3 * head_off_road_score * 100.0 +
-        w4 * yawning_score * 100.0
-    )
-    
-    # Ensure score is in valid range
-    weighted_score = max(0.0, min(100.0, weighted_score))
-    
-    return {
-        "weighted_score": round(weighted_score, 2),
-        "weighted_level": _risk_level_weighted(weighted_score),
-        "component_scores": {
-            "overspeed_component": round(w1 * speed_normalized * 100.0, 2),
-            "drowsiness_component": round(w2 * eyes_closed_score * 100.0, 2),
-            "distraction_component": round(w3 * head_off_road_score * 100.0, 2),
-            "yawning_component": round(w4 * yawning_score * 100.0, 2),
-        },
-        "weights": {"w1_overspeed": w1, "w2_drowsiness": w2, "w3_distraction": w3, "w4_yawning": w4}
-    }
-
-
 def _compute_risk(payload: Dict[str, Any], detection_result: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Compute risk using the separate risk engine.
+
+    This function intentionally does not extract face metrics.
+    It consumes behavior events + raw_scores (from behavior layer) and speed.
+    """
     metrics = payload.get("metrics", {}) or {}
     trip_id = payload.get("trip_id", "")
 
     if detection_result is None:
         detection_result = _compute_detection(payload)
 
-    raw_scores = detection_result.get("raw_scores", {})
-
     speed = max(0.0, _to_float(metrics.get("speed", payload.get("speed", 0.0))))
-    eyes_closed_score = _to_float(raw_scores.get("eyes_closed_score", metrics.get("eyes_closed_score", 0.0)))
-    head_off_road_score = _to_float(raw_scores.get("head_off_road_score", metrics.get("head_off_road_score", 0.0)))
-    yawning_score = _to_float(raw_scores.get("yawning_score", metrics.get("yawning_score", 0.0)))
+    detections = detection_result.get("detections", []) or []
+    raw_scores = detection_result.get("raw_scores", None)
 
-    # Update event counters based on current frame detections
-    if eyes_closed_score >= 0.6:
-        _increment_event_counter(trip_id, "drowsiness")
-    
-    if yawning_score >= 0.55:
-        _increment_event_counter(trip_id, "yawning")
-    
-    if head_off_road_score >= 0.5:
-        _increment_event_counter(trip_id, "looking_away")
-    
-    # Track overspeed
-    _increment_overspeed(trip_id, speed)
-    
-    # Get current counters for this trip
-    counters = _get_trip_counters(trip_id)
-
-    # **RULE-BASED RISK SCORING**
-    # Base score from current frame
-    base_score = (
-        eyes_closed_score * 45.0
-        + head_off_road_score * 30.0
-        + yawning_score * 15.0
-        + min(speed, 120.0) / 120.0 * 10.0
+    return get_risk_engine().compute(
+        trip_id=trip_id or "unknown_trip",
+        detections=detections,
+        raw_scores=raw_scores,
+        speed_kmh=speed,
     )
-    
-    # **Risk Escalation Rules** (temporal patterns)
-    # Rule 1: Repeated drowsiness events escalate risk
-    if counters["drowsiness_events"] >= 3:
-        base_score += 20.0  # Escalate for pattern
-    elif counters["drowsiness_events"] >= 2:
-        base_score += 10.0
-    
-    # Rule 2: Multiple yawning events (fatigue pattern)
-    if counters["yawning_events"] >= 4:
-        base_score += 15.0
-    elif counters["yawning_events"] >= 2:
-        base_score += 5.0
-    
-    # Rule 3: Repeated distraction (not focusing on road)
-    if counters["looking_away_events"] >= 5:
-        base_score += 25.0
-    elif counters["looking_away_events"] >= 3:
-        base_score += 15.0
-    
-    # Rule 4: Overspeed + fatigue = critical
-    if counters["overspeed_count"] > 0:
-        overspeed_ratio = counters["overspeed_count"] / max(counters["total_frames_analyzed"], 1)
-        if overspeed_ratio > 0.5 and (counters["drowsiness_events"] > 0 or counters["yawning_events"] > 0):
-            base_score += 20.0  # Critical combination
-
-    score = max(0.0, min(100.0, base_score))
-
-    reasons = []
-    if eyes_closed_score >= 0.6:
-        reasons.append("high_eye_closure")
-    if head_off_road_score >= 0.5:
-        reasons.append("driver_distraction")
-    if yawning_score >= 0.55:
-        reasons.append("frequent_yawning")
-    if speed >= 80:
-        reasons.append("elevated_speed")
-    
-    # Pattern-based reasons
-    if counters["drowsiness_events"] >= 3:
-        reasons.append("repeated_drowsiness")
-    if counters["looking_away_events"] >= 3:
-        reasons.append("persistent_distraction")
-    if counters["overspeed_count"] > 3:
-        reasons.append("continuous_speeding")
-
-    # Compute weighted risk score (Task 7)
-    raw_scores = detection_result.get("raw_scores", {})
-    weighted_result = _compute_weighted_risk(
-        detection_result,
-        {**metrics, "speed": speed}
-    )
-    
-    # Determine recommended risk level (use weighted as primary)
-    recommended_level = weighted_result["weighted_level"]
-    
-    return {
-        "risk_score_temporal": round(score, 2),  # Task 6 temporal escalation
-        "risk_level_temporal": _risk_level(score),  # LOW/MEDIUM/HIGH/CRITICAL
-        "risk_score_weighted": weighted_result["weighted_score"],  # Task 7 composite
-        "risk_level_weighted": weighted_result["weighted_level"],  # SAFE/MODERATE/HIGH/CRITICAL
-        "risk_level": recommended_level,  # Recommended (weighted primary)
-        "reasons": reasons,
-        "event_counters": counters,
-        "weighted_breakdown": weighted_result["component_scores"],
-        "weights": weighted_result["weights"],
-    }
 
 
 def _is_trip_active(trip_id: str) -> bool:
     """
-    Check if a trip is currently active.
-    Returns: True if active or if check fails (fallback), False if explicitly inactive.
+    Check if a trip is currently active (backend source of truth).
+    On transport errors returns False so results route to /events instead of a stale trip doc.
     """
     if not trip_id:
         return False
@@ -890,8 +1000,8 @@ def _is_trip_active(trip_id: str) -> bool:
             check_data = json.loads(check_resp.read().decode("utf-8"))
             return check_data.get("is_active", False)
     except Exception:
-        # If check fails, assume trip is active (fallback to old behavior)
-        return True
+        # If check fails, prefer background /events routing (avoids appending to completed trips).
+        return False
 
 
 def _post_result_to_backend(result_payload: Dict[str, Any]) -> Tuple[bool, str]:
@@ -901,34 +1011,54 @@ def _post_result_to_backend(result_payload: Dict[str, Any]) -> Tuple[bool, str]:
         return False, "trip_id missing; callback skipped"
 
     try:
-        # Check if trip is active
         is_active = _is_trip_active(trip_id)
     except Exception:
-        # If check fails, assume trip is active (fallback to old behavior)
-        is_active = True
+        is_active = False
 
     # Route to appropriate endpoint
     if is_active:
         endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/trips/{trip_id}/ai-results"
     else:
-        # No active trip - post to general events collection
         endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/events"
         result_payload["is_sos"] = result_payload.get("sos_triggered", False)
-    
-    try:
+
+    def _post_to(url: str) -> Tuple[int, str]:
         body = json.dumps(result_payload).encode("utf-8")
         req = Request(
-            endpoint,
+            url,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urlopen(req, timeout=5) as response:
             status = getattr(response, "status", 200)
+        return int(status), url
+
+    try:
+        status, _ = _post_to(endpoint)
         if 200 <= status < 300:
             return True, "sent"
         return False, f"backend returned {status}"
     except HTTPError as exc:
+        # Completed / inactive trip: store under global events instead of trip history.
+        if is_active and int(exc.code) == 409:
+            try:
+                fallback = dict(result_payload)
+                fallback["is_sos"] = fallback.get("sos_triggered", False)
+                body_fb = json.dumps(fallback).encode("utf-8")
+                fb_url = f"{BACKEND_BASE_URL.rstrip('/')}/events"
+                req_fb = Request(
+                    fb_url,
+                    data=body_fb,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(req_fb, timeout=5) as resp_fb:
+                    st = getattr(resp_fb, "status", 200)
+                if 200 <= int(st) < 300:
+                    return True, "sent (events; trip not active)"
+            except Exception:
+                pass
         return False, f"backend returned {exc.code}"
     except URLError as exc:
         return False, str(exc)
@@ -982,7 +1112,7 @@ def _post_sos_event_to_backend(sos_payload: Dict[str, Any]) -> Tuple[bool, str]:
 @app.get("/trips/<trip_id>/counters")
 def get_trip_counters_endpoint(trip_id: str) -> Any:
     """Get current event counters for a specific trip."""
-    counters = _get_trip_counters(trip_id)
+    counters = get_risk_engine().get_trip_counters(trip_id)
     return jsonify({
         "trip_id": trip_id,
         "event_counters": counters,
@@ -993,8 +1123,7 @@ def get_trip_counters_endpoint(trip_id: str) -> Any:
 @app.post("/trips/<trip_id>/counters/reset")
 def reset_trip_counters_endpoint(trip_id: str) -> Any:
     """Reset event counters for a trip (useful for testing or trip restart)."""
-    if trip_id in trip_event_counters:
-        del trip_event_counters[trip_id]
+    get_risk_engine().reset_trip(trip_id)
     return jsonify({
         "trip_id": trip_id,
         "message": "Event counters reset",
@@ -1005,7 +1134,7 @@ def reset_trip_counters_endpoint(trip_id: str) -> Any:
 @app.post("/trips/<trip_id>/complete")
 def complete_trip_endpoint(trip_id: str) -> Any:
     """Mark trip as complete and clear event counters."""
-    counters = _get_trip_counters(trip_id)
+    counters = get_risk_engine().get_trip_counters(trip_id)
     summary = {
         "trip_id": trip_id,
         "final_event_counters": counters.copy(),
@@ -1014,15 +1143,167 @@ def complete_trip_endpoint(trip_id: str) -> Any:
     }
     
     # Clear counters for this trip
-    if trip_id in trip_event_counters:
-        del trip_event_counters[trip_id]
+    get_risk_engine().reset_trip(trip_id)
+
+    # Clear locked identity/session state for this trip
+    try:
+        get_driver_session_manager().reset_session(session_key=trip_id)
+    except Exception:
+        pass
     
     return jsonify(summary), 200
 
 
+@app.post("/trips/<trip_id>/session/reset")
+def reset_trip_session_endpoint(trip_id: str) -> Any:
+    """Reset cached identity/threshold session state for a trip.
+
+    This is useful when backend calibration/threshold values change and you want
+    the AI engine to re-fetch thresholds immediately (instead of waiting for TTL).
+    """
+    try:
+        get_driver_session_manager().reset_session(session_key=trip_id)
+    except Exception:
+        pass
+
+    # Also clear temporal state so detections don't carry over.
+    try:
+        get_behavior_engine().reset_all()
+    except Exception:
+        pass
+
+    return jsonify(
+        {
+            "trip_id": trip_id,
+            "message": "Trip session state reset",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    ), 200
+
+
 @app.get("/health")
 def health() -> Any:
-    return jsonify({"status": "ok", "service": "ai_engine", "detector": "opencv+haar_cascades"}), 200
+    return jsonify({"status": "ok", "service": "ai_engine", "detector": "mediapipe_facemesh"}), 200
+
+
+@app.post("/drivers/<driver_id>/calibration/start")
+def start_driver_calibration(driver_id: str) -> Any:
+    engine = get_calibration_engine()
+    progress = engine.start(driver_id=driver_id)
+    return jsonify({
+        "driver_id": driver_id,
+        "phase": progress.current_phase.value,
+        "instructions": engine.phase_instructions(progress.current_phase),
+        "frames_collected": progress.frames_collected,
+        "frames_needed": progress.frames_needed,
+        "is_complete": progress.is_complete,
+    }), 200
+
+
+@app.get("/drivers/<driver_id>/calibration/status")
+def get_driver_calibration_status(driver_id: str) -> Any:
+    engine = get_calibration_engine()
+    progress = engine.get_progress(driver_id=driver_id)
+    return jsonify({
+        "driver_id": driver_id,
+        "phase": progress.current_phase.value,
+        "instructions": engine.phase_instructions(progress.current_phase),
+        "frames_collected": progress.frames_collected,
+        "frames_needed": progress.frames_needed,
+        "is_complete": progress.is_complete,
+    }), 200
+
+
+@app.post("/drivers/<driver_id>/calibration/frame")
+def submit_driver_calibration_frame(driver_id: str) -> Any:
+    payload = request.get_json(silent=True) or {}
+    image_data = payload.get("image") or payload.get("frame")
+    phase_raw = payload.get("phase")
+    auto_advance = bool(payload.get("auto_advance", True))
+
+    if not image_data:
+        return jsonify({"error": "image is required"}), 400
+    if not phase_raw:
+        return jsonify({"error": "phase is required"}), 400
+
+    try:
+        phase = CalibrationPhase(str(phase_raw))
+    except Exception:
+        return jsonify({"error": f"invalid phase: {phase_raw}"}), 400
+
+    image = _decode_image(str(image_data))
+    if image is None:
+        return jsonify({"error": "failed to decode image"}), 400
+
+    cv_metrics = _process_frame_with_landmarks(image)
+    engine = get_calibration_engine()
+    try:
+        progress = engine.add_metrics(
+            driver_id=driver_id,
+            metrics=cv_metrics,
+            phase=phase,
+            auto_advance=auto_advance,
+        )
+
+        resp: Dict[str, Any] = {
+            "driver_id": driver_id,
+            "phase": progress.current_phase.value,
+            "instructions": engine.phase_instructions(progress.current_phase),
+            "frames_collected": progress.frames_collected,
+            "frames_needed": progress.frames_needed,
+            "is_complete": progress.is_complete,
+            "cv_metrics": cv_metrics,
+        }
+        if progress.thresholds:
+            resp["thresholds"] = progress.thresholds
+        if progress.baseline:
+            resp["baseline"] = progress.baseline
+        return jsonify(resp), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"calibration frame failed: {e}"}), 500
+
+
+@app.post("/drivers/<driver_id>/calibration/complete")
+def complete_driver_calibration(driver_id: str) -> Any:
+    engine = get_calibration_engine()
+    try:
+        result = engine.freeze_thresholds(driver_id=driver_id)
+        return jsonify(result), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"calibration complete failed: {e}"}), 500
+
+
+@app.post("/drivers/register")
+def register_driver() -> Any:
+    payload = request.get_json(silent=True) or {}
+    driver_id = (payload.get("driver_id") or "").strip()
+    images_b64 = payload.get("images") or []
+
+    if not driver_id:
+        return jsonify({"error": "driver_id is required"}), 400
+    if not isinstance(images_b64, list) or len(images_b64) == 0:
+        return jsonify({"error": "images must be a non-empty list of base64 strings"}), 400
+
+    try:
+        images_bgr = [decode_base64_image_to_bgr(s) for s in images_b64]
+        result = get_driver_registry_service().register_driver_from_images(
+            driver_id=driver_id,
+            images_bgr=images_bgr,
+        )
+        return jsonify({
+            "driver_id": result.driver_id,
+            "samples_used": result.samples_used,
+            "embedding_dim": result.embedding_dim,
+            "registered": True,
+        }), 200
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"registration failed: {e}"}), 500
 
 
 @app.post("/analyze_frame")
@@ -1033,74 +1314,137 @@ def analyze_frame() -> Any:
     detection_result = _compute_detection(payload)
     risk_result = _compute_risk(payload, detection_result)
     
+    # Debug output for detection values
+    metrics = detection_result.get("metrics", {})
+    if metrics:
+        ear = metrics.get("ear", 0.0)
+        mar = metrics.get("mar", 0.0)
+        yaw = metrics.get("yaw_angle", 0.0)
+        personalization = detection_result.get("personalization", {})
+        thresholds = personalization.get("thresholds_used", {})
+        
+        print(f"[Frame] EAR={ear:.3f} (thresh={thresholds.get('ear_drowsiness', 0.20):.3f}) | "
+              f"MAR={mar:.3f} (thresh={thresholds.get('mar_yawning', 0.08):.3f}) | "
+              f"Yaw={yaw:.1f}° | Detections: {len(detection_result['detections'])}")
+    
     sos_gesture = detection_result.get("sos_gesture", {})
-    sos_triggered = sos_gesture.get("sos_triggered", False)
-    
-    # Check if trip is active before allowing SOS trigger
-    # SOS only triggers when there is an active trip
     trip_is_active = _is_trip_active(trip_id) if trip_id else False
+    sos_triggered = bool(sos_gesture.get("sos_triggered", False)) and bool(trip_is_active)
     if not trip_is_active:
-        sos_triggered = False
-    
+        try:
+            sos_gesture = dict(sos_gesture)
+            sos_gesture["sos_triggered"] = False
+            detection_result["sos_gesture"] = sos_gesture
+        except Exception:
+            pass
+
     event_counters = risk_result.get("event_counters", {})
 
+    # Final fusion decision (driver risk + emotion support signal + SOS override).
+    emotion_result = detection_result.get("emotion")
+    final_decision = get_final_decision_engine().decide(
+        risk_result=risk_result,
+        emotion_result=emotion_result,
+        sos_triggered=bool(sos_triggered),
+    )
+
     ts = datetime.now(timezone.utc).isoformat()
+    recommended_score = final_decision.get("risk_score")
+    risk_score_weighted = final_decision.get("risk_score_weighted")
+    risk_level_weighted = final_decision.get("risk_level_weighted")
+    risk_level = final_decision.get("risk_level")
+
+    # Compute user-facing warnings (with cooldown). Audio/UI is handled elsewhere.
+    alert_engine = get_alert_engine()
+    warnings = alert_engine.get_warnings(
+        trip_id=str(trip_id or "unknown_trip"),
+        detections=detection_result.get("detections", []),
+        risk_level_weighted=str(risk_level_weighted or ""),
+        sos_triggered=bool(sos_triggered),
+    )
+
+    emo = (emotion_result or {}) if isinstance(emotion_result, dict) else {}
+    driver_emotion_payload = {
+        "driver_emotion": str(emo.get("dominant_emotion") or "unknown"),
+        "confidence": float(emo.get("confidence") or 0.0),
+    }
+
     result_payload = {
         "trip_id": trip_id,
         "timestamp": ts,
         "detections": detection_result["detections"],
         "risk_score_temporal": risk_result.get("risk_score_temporal"),
         "risk_level_temporal": risk_result.get("risk_level_temporal"),
-        "risk_score_weighted": risk_result.get("risk_score_weighted"),
-        "risk_level_weighted": risk_result.get("risk_level_weighted"),
-        "risk_score": risk_result.get("risk_level"),  # Primary recommendation
-        "risk_level": risk_result.get("risk_level"),  # Primary recommendation
+        "risk_score_weighted": risk_score_weighted,
+        "risk_level_weighted": risk_level_weighted,
+        "risk_score": recommended_score,  # Primary recommendation score
+        "risk_level": risk_level,  # Primary recommendation label
         "reasons": risk_result["reasons"],
         "event_counters": event_counters,
         "sos_triggered": sos_triggered,
         "sos_gesture": sos_gesture,
+        "driver_emotion": driver_emotion_payload,
         "metadata": {
             "input_type": payload.get("input_type", "frame"),
             "frame_id": payload.get("frame_id"),
             "video_id": payload.get("video_id"),
-            "cv_metrics": detection_result.get("metrics", {})
+            "cv_metrics": detection_result.get("metrics", {}),
+            "driver": detection_result.get("driver"),
+            "passengers": detection_result.get("passengers", []),
+            "trip_active": trip_is_active,
+            "driver_emotion": driver_emotion_payload,
+            "warnings": warnings,
         },
     }
 
     sent_to_backend, callback_message = _post_result_to_backend(result_payload)
     
-    # If SOS triggered AND trip is active, send separate SOS event to backend
-    # SOS only posts when there is an active trip
+    # Dedicated SOS feed (ONLY when trip is active).
     if sos_triggered and trip_is_active:
+        sos_person = str(sos_gesture.get("person") or "driver")
+        sos_source = (
+            "ai_engine_passenger_hand_gesture"
+            if sos_person == "passenger"
+            else "ai_engine_hand_gesture"
+        )
         sos_event_payload = {
             "trip_id": trip_id,
             "event_type": "SOS",
             "timestamp": ts,
-            "source": "ai_engine_hand_gesture",
+            "source": sos_source,
             "duration": sos_gesture.get("duration", 0.0),
+            "risk_score_weighted": risk_score_weighted,
+            "risk_level": risk_level,
             "metadata": {
                 "palm_open": True,
-                "hands_detected": sos_gesture.get("hands_detected", 0)
-            }
+                "hands_detected": sos_gesture.get("hands_detected", 0),
+                "person": sos_person,
+            },
         }
         _post_sos_event_to_backend(sos_event_payload)
 
     return jsonify({
         "trip_id": trip_id,
+        "trip_active": trip_is_active,
         "detections": detection_result["detections"],
+        "driver": detection_result.get("driver"),
+        "passengers": detection_result.get("passengers", []),
         "risk_score_temporal": risk_result.get("risk_score_temporal"),
         "risk_level_temporal": risk_result.get("risk_level_temporal"),
-        "risk_score_weighted": risk_result.get("risk_score_weighted"),
-        "risk_level_weighted": risk_result.get("risk_level_weighted"),
-        "risk_score": risk_result.get("risk_level"),  # Primary recommendation
-        "risk_level": risk_result.get("risk_level"),  # Primary recommendation
+        "risk_score_weighted": risk_score_weighted,
+        "risk_level_weighted": risk_level_weighted,
+        "risk_score": recommended_score,  # Primary recommendation score
+        "risk_level": risk_level,  # Primary recommendation label
         "reasons": risk_result["reasons"],
         "event_counters": event_counters,
         "weighted_breakdown": risk_result.get("weighted_breakdown"),
         "weights": risk_result.get("weights"),
         "sos_triggered": sos_triggered,
         "sos_gesture": sos_gesture,
+        "driver_emotion": driver_emotion_payload,
+        "emotion_result": emotion_result,
         "cv_metrics": detection_result.get("metrics", {}),
+        "warnings": warnings,
         "backend_callback": {
             "sent": sent_to_backend,
             "message": callback_message,
@@ -1115,6 +1459,9 @@ def compute_risk() -> Any:
 
     risk_result = _compute_risk(payload)
     ts = datetime.now(timezone.utc).isoformat()
+    recommended_score = risk_result.get("risk_score_weighted")
+    if recommended_score is None:
+        recommended_score = risk_result.get("risk_score_temporal")
 
     result_payload = {
         "trip_id": trip_id,
@@ -1124,7 +1471,7 @@ def compute_risk() -> Any:
         "risk_level_temporal": risk_result.get("risk_level_temporal"),
         "risk_score_weighted": risk_result.get("risk_score_weighted"),
         "risk_level_weighted": risk_result.get("risk_level_weighted"),
-        "risk_score": risk_result.get("risk_level"),
+        "risk_score": recommended_score,
         "risk_level": risk_result.get("risk_level"),
         "reasons": risk_result.get("reasons", []),
         "metadata": {
@@ -1142,7 +1489,7 @@ def compute_risk() -> Any:
         "risk_level_temporal": risk_result.get("risk_level_temporal"),
         "risk_score_weighted": risk_result.get("risk_score_weighted"),
         "risk_level_weighted": risk_result.get("risk_level_weighted"),
-        "risk_score": risk_result.get("risk_level"),
+        "risk_score": recommended_score,
         "risk_level": risk_result.get("risk_level"),
         "reasons": risk_result.get("reasons", []),
         "weighted_breakdown": risk_result.get("weighted_breakdown"),

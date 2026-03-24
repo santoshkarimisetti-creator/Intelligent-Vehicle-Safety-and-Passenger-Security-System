@@ -1,96 +1,48 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect } from 'react'
+import { Link } from 'react-router-dom'
 import '../styles/events.css'
+
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
 
 export default function EmergencyEventsPage() {
   const [events, setEvents] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [pageNum, setPageNum] = useState(1)
+  const [totalCount, setTotalCount] = useState(0)
   const itemsPerPage = 10
-
-  const audioContextRef = useRef(null)
-  const oscillatorRef = useRef(null)
-  const gainNodeRef = useRef(null)
-  const alertTimeoutRef = useRef(null)
-
-  // Initialize Web Audio API
-  useEffect(() => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
-    }
-  }, [])
-
-  // Play critical SOS alarm
-  const playSOSAlarm = () => {
-    if (!audioContextRef.current) return
-
-    // Stop any existing sound
-    if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current)
-    if (oscillatorRef.current) {
-      try {
-        oscillatorRef.current.stop()
-        oscillatorRef.current.disconnect()
-      } catch (e) {}
-    }
-    if (gainNodeRef.current) {
-      try {
-        gainNodeRef.current.disconnect()
-      } catch (e) {}
-    }
-
-    const ctx = audioContextRef.current
-    let cycleCount = 0
-
-    const playCycle = () => {
-      if (cycleCount >= 5) return // Repeat 5 times
-
-      const osc = ctx.createOscillator()
-      const gain = ctx.createGain()
-      osc.connect(gain)
-      gain.connect(ctx.destination)
-
-      osc.frequency.setValueAtTime(1500, ctx.currentTime)
-      osc.frequency.exponentialRampToValueAtTime(700, ctx.currentTime + 0.4)
-      osc.type = 'square'
-
-      gain.gain.setValueAtTime(0.3, ctx.currentTime)
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.4)
-
-      osc.start(ctx.currentTime)
-      osc.stop(ctx.currentTime + 0.4)
-
-      cycleCount++
-      alertTimeoutRef.current = setTimeout(playCycle, 500)
-    }
-
-    playCycle()
-  }
-
-  // Play alarm when emergency events appear
-  useEffect(() => {
-    if (events.length > 0) {
-      playSOSAlarm()
-    }
-  }, [events])
 
   useEffect(() => {
     const fetchEmergencyEvents = async () => {
       try {
         setLoading(true)
-        const response = await fetch(`http://localhost:5000/events/emergency?limit=${itemsPerPage}&skip=${(pageNum - 1) * itemsPerPage}`)
+        const response = await fetch(`${API_BASE}/events/emergency?limit=${itemsPerPage}&skip=${(pageNum - 1) * itemsPerPage}`)
         if (!response.ok) throw new Error('Failed to fetch emergency events')
         const data = await response.json()
-        setEvents(data.emergency_events || data.events || [])
+        const eventsList = data.emergency_events || data.events || []
+        
+        // Sort by timestamp descending (newest first)
+        eventsList.sort((a, b) => {
+          const aTime = a?.received_at ? new Date(a.received_at).getTime() : 0
+          const bTime = b?.received_at ? new Date(b.received_at).getTime() : 0
+          return bTime - aTime
+        })
+        
+        setEvents(eventsList)
+        setTotalCount(data.total_sos_count || 0)
         setError(null)
       } catch (err) {
         setError(err.message)
         setEvents([])
+        setTotalCount(0)
       } finally {
         setLoading(false)
       }
     }
     fetchEmergencyEvents()
   }, [pageNum])
+
+  const totalPages = Math.max(1, Math.ceil((totalCount || 0) / itemsPerPage))
 
   const formatTimestamp = (ts) => {
     if (!ts) return 'Unknown'
@@ -201,7 +153,7 @@ export default function EmergencyEventsPage() {
 
                 <div className="emergency-actions">
                   {event.trip_id && (
-                    <a href={`/#/trips/${event.trip_id}`} className="action-btn primary">View Trip Details</a>
+                    <Link to={`/trips/${event.trip_id}`} className="action-btn primary">View Trip Details</Link>
                   )}
                 </div>
               </div>
@@ -216,10 +168,21 @@ export default function EmergencyEventsPage() {
             >
               Previous
             </button>
-            <span className="page-info">Page {pageNum}</span>
+            <span className="page-info">Page {pageNum} / {totalPages}</span>
+
+            {Array.from({ length: totalPages }, (_, i) => i + 1).map(p => (
+              <button
+                key={p}
+                onClick={() => setPageNum(p)}
+                disabled={p === pageNum}
+                className="pagination-btn pagination-page-btn"
+              >
+                {p}
+              </button>
+            ))}
             <button 
               onClick={() => setPageNum(pageNum + 1)}
-              disabled={events.length < itemsPerPage}
+              disabled={pageNum >= totalPages}
               className="pagination-btn"
             >
               Next

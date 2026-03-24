@@ -3,12 +3,15 @@ import { useParams, Link } from 'react-router-dom'
 import MapReplay from '../components/MapReplay'
 import { getTrip } from '../api/trips'
 
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
+
 export default function TripDetail(){
   const { id } = useParams()
   const [trip, setTrip] = useState(null)
   const [path, setPath] = useState([])
   const [events, setEvents] = useState([])
   const [error, setError] = useState('')
+  const [downloading, setDownloading] = useState(false)
 
   useEffect(()=>{
     let mounted = true
@@ -45,6 +48,46 @@ export default function TripDetail(){
     })
   },[events])
 
+  const downloadReportPdf = async () => {
+    if (!id || downloading) return
+    setDownloading(true)
+    try {
+      const res = await fetch(`${API_BASE}/trip/${encodeURIComponent(id)}/report`)
+      const contentType = String(res.headers.get('content-type') || '').toLowerCase()
+
+      if (!res.ok || !contentType.includes('application/pdf')) {
+        let message = `Download failed (${res.status})`
+        try {
+          if (contentType.includes('application/json')) {
+            const body = await res.json()
+            message = body?.error || body?.message || message
+          } else {
+            const text = await res.text()
+            if (text) message = text.slice(0, 200)
+          }
+        } catch {
+          // keep default message
+        }
+        throw new Error(message)
+      }
+
+      const blob = await res.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${id}_report.pdf`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      window.URL.revokeObjectURL(url)
+    } catch (e) {
+      console.warn(e)
+      setError(e?.message ? `Unable to download report: ${e.message}` : 'Unable to download report.')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
   return (
     <div className="page trip-detail">
       <h1>Trip {id}</h1>
@@ -71,6 +114,15 @@ export default function TripDetail(){
             <li>Max Speed: {trip?.maxSpeed ?? '-'}</li>
             <li>Risk Level: {trip?.risk || 'Unknown'}</li>
           </ul>
+          <div style={{marginTop: 12}}>
+            <button
+              className="action-btn primary"
+              onClick={downloadReportPdf}
+              disabled={downloading}
+            >
+              {downloading ? 'Downloading…' : 'Download Report'}
+            </button>
+          </div>
         </section>
 
         <section className="card alerts">

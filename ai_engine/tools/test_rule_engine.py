@@ -6,6 +6,17 @@ This script validates the rule-based temporal escalation logic by sending
 test sequences to the AI Engine and verifying event counter behavior.
 """
 
+import os
+
+import pytest
+
+
+if __name__ != "__main__" and os.environ.get("RUN_INTEGRATION_TESTS") != "1":
+    pytest.skip(
+        "integration script (requires ai_engine on localhost:5001); set RUN_INTEGRATION_TESTS=1",
+        allow_module_level=True,
+    )
+
 import json
 import requests
 import time

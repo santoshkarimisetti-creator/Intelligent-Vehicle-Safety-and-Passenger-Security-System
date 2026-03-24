@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Quick test for Task 7 - Composite Weighted Risk Formula"""
+"""Quick test for Task 7 - Composite Weighted Risk Formula.
+
+This is intended to be run manually against a running AI engine.
+Pytest collection skips it by default.
+"""
+
+import os
+
+import pytest
+
+
+if __name__ != "__main__" and os.environ.get("RUN_INTEGRATION_TESTS") != "1":
+    pytest.skip(
+        "integration script (requires ai_engine on localhost:5001); set RUN_INTEGRATION_TESTS=1",
+        allow_module_level=True,
+    )
 
 import requests
 import json

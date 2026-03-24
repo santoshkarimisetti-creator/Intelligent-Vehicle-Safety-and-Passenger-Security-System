@@ -429,6 +429,13 @@
   transition: background-color 0.3s ease;
 }
 
+/* Smaller buttons for numeric page jumps */
+.pagination-page-btn {
+  padding: 6px 10px;
+  font-size: 12px;
+  min-width: 34px;
+}
+
 .page.emergency-events .pagination-btn {
   background: #ff4444;
 }

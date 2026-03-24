@@ -1,20 +1,23 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import uuid
-from math import radians, sin, cos, sqrt, atan2
+from math import radians, sin, cos, sqrt, atan2, log, tan, pi
 from zeroconf import ServiceInfo, Zeroconf
 import socket
 import threading
 import os
+import io
+import csv
+import urllib.request
 from calibration_model import (
     get_driver_calibration,
     create_driver_calibration,
-    update_calibration_samples,
     get_personalized_thresholds,
+    compute_and_store_thresholds,
     calibration_collection
 )
 
@@ -51,7 +54,9 @@ CORS(app)
 # MongoDB Connection
 MONGO_URI = "mongodb://localhost:27017/"
 client = MongoClient(MONGO_URI)
-db = client["ivs_db"]
+# DB selection: Connect to ivs_db (existing database with records)
+db_name = "ivs_db"
+db = client[db_name]
 trips_collection = db["trips"]
 events_collection = db["events"]  # For detections when no active trip
 
@@ -79,6 +84,53 @@ def to_ist_display(value):
 
     ist_dt = dt.astimezone(IST_ZONE)
     return ist_dt.strftime("%d/%m/%Y, %I:%M:%S %p IST")
+
+
+def _parse_iso_to_utc_naive(value):
+    """Parse ISO datetime to naive UTC datetime for Mongo range queries."""
+    if not value:
+        return None
+    try:
+        normalized = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.replace(tzinfo=None)
+
+
+def _extract_detection_labels(detections):
+    """Return unique detection labels from a detections payload."""
+    labels = []
+
+    if isinstance(detections, list):
+        for item in detections:
+            if isinstance(item, str):
+                label = item.strip()
+                if label:
+                    labels.append(label)
+            elif isinstance(item, dict):
+                label = str(item.get("type") or item.get("label") or item.get("name") or item.get("event") or "").strip()
+                if label:
+                    labels.append(label)
+    elif isinstance(detections, dict):
+        for k, v in detections.items():
+            if v:
+                label = str(k).strip()
+                if label:
+                    labels.append(label)
+
+    seen = set()
+    uniq = []
+    for l in labels:
+        if l in seen:
+            continue
+        seen.add(l)
+        uniq.append(l)
+    return uniq
 
 
 def haversine_distance(lat1, lon1, lat2, lon2):
@@ -128,9 +180,9 @@ def compute_trip_distance_km(path):
 
         try:
             prev_lat = float(prev.get("lat", prev.get("latitude", 0)) or 0)
-            prev_lon = float(prev.get("lon", prev.get("longitude", 0)) or 0)
+            prev_lon = float(prev.get("lng", prev.get("lon", prev.get("longitude", 0))) or 0)
             curr_lat = float(curr.get("lat", curr.get("latitude", 0)) or 0)
-            curr_lon = float(curr.get("lon", curr.get("longitude", 0)) or 0)
+            curr_lon = float(curr.get("lng", curr.get("lon", curr.get("longitude", 0))) or 0)
         except (TypeError, ValueError):
             continue
 
@@ -262,14 +314,20 @@ def get_trip(trip_id):
         
         # Add AI detection events
         for ai_event in trip.get("ai_events", []):
+            labels = _extract_detection_labels(ai_event.get("detections", []))
+            raw_type = str(ai_event.get("event_type") or "").strip()
+            is_generic = (not raw_type) or (raw_type in {"DETECTION", "AI Detection", "AI_DETECTION", "Multiple"})
+            primary = (", ".join(labels) if len(labels) > 1 else labels[0]) if labels else ("No Detections" if is_generic else raw_type)
+            label_text = ", ".join(labels) if labels else "none"
             consolidated_events.append({
                 "timestamp": ai_event.get("timestamp"),
-                "type": "AI Detection",
-                "event_type": "AI Detection",
-                "description": f"Risk: {ai_event.get('risk_level', 'UNKNOWN')} - Detections: {', '.join(ai_event.get('detections', []))}",
+                "type": primary,
+                "event_type": primary,
+                "description": f"Risk: {ai_event.get('risk_level', 'UNKNOWN')} - Detections: {label_text}",
                 "details": ai_event.get("reasons", []),
                 "risk_level": ai_event.get("risk_level"),
-                "detections": ai_event.get("detections", [])
+                "detections": ai_event.get("detections", []),
+                "event_labels": labels,
             })
         
         # Add SOS events
@@ -293,6 +351,411 @@ def get_trip(trip_id):
         return jsonify({"error": str(e)}), 500
 
 
+def _normalize_timestamp(value):
+    """Normalize timestamps for JSON/PDF/CSV exports."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        # Store as ISO-8601 string.
+        return value.isoformat()
+    return value
+
+
+def _build_consolidated_trip_events(trip: dict) -> list[dict]:
+    """Build a frontend-friendly events timeline (used by Level-3 exports)."""
+    consolidated_events: list[dict] = []
+
+    # Add AI detection events
+    for ai_event in trip.get("ai_events", []) or []:
+        labels = _extract_detection_labels(ai_event.get("detections", []))
+        raw_type = str(ai_event.get("event_type") or "").strip()
+        is_generic = (not raw_type) or (raw_type in {"DETECTION", "AI Detection", "AI_DETECTION", "Multiple"})
+        primary = (
+            (", ".join(labels) if len(labels) > 1 else labels[0])
+            if labels
+            else ("No Detections" if is_generic else raw_type)
+        )
+        label_text = ", ".join(labels) if labels else "none"
+
+        consolidated_events.append(
+            {
+                "timestamp": _normalize_timestamp(ai_event.get("timestamp")),
+                "type": primary,
+                "event_type": primary,
+                "description": f"Risk: {ai_event.get('risk_level', 'UNKNOWN')} - Detections: {label_text}",
+                "details": ai_event.get("reasons", []),
+                "risk_level": ai_event.get("risk_level"),
+                "detections": ai_event.get("detections", []),
+                "event_labels": labels,
+            }
+        )
+
+    # Add SOS events
+    for sos_event in trip.get("sos_events", []) or []:
+        consolidated_events.append(
+            {
+                "timestamp": _normalize_timestamp(sos_event.get("timestamp")),
+                "type": "SOS Alert",
+                "event_type": "SOS",
+                "description": f"Emergency SOS triggered from {sos_event.get('source', 'unknown')}",
+                "details": sos_event.get("metadata", {}),
+                "is_sos": True,
+            }
+        )
+
+    # Sort by timestamp (ISO strings should sort lexicographically).
+    consolidated_events.sort(key=lambda x: x.get("timestamp") or "", reverse=True)
+    return consolidated_events
+
+
+def _get_trip_or_404(trip_id: str) -> tuple[dict | None, tuple | None]:
+    trip = trips_collection.find_one({"trip_id": trip_id})
+    if not trip:
+        return None, (jsonify({"error": "Trip not found"}), 404)
+    return trip, None
+
+
+def _render_route_png(path: list[dict]) -> bytes:
+    """Render route on top of real OpenStreetMap tiles, fallback to local drawing."""
+    from PIL import Image, ImageDraw
+
+    width, height = 1000, 500
+    tile_size = 256
+    line_color = (220, 20, 60)  # crimson
+
+    coords: list[tuple[float, float]] = []  # (lon, lat)
+    for pt in path or []:
+        lat = pt.get("lat")
+        lng = pt.get("lng", pt.get("lon"))
+        if lat is None or lng is None:
+            continue
+        try:
+            lat_f = float(lat)
+            lng_f = float(lng)
+            # Clamp latitude to Web Mercator valid range.
+            lat_f = max(-85.0511, min(85.0511, lat_f))
+            coords.append((lng_f, lat_f))
+        except Exception:
+            continue
+
+    def _fallback() -> bytes:
+        img = Image.new("RGB", (width, height), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+
+        if len(coords) < 2:
+            draw.text((20, 20), "No route data available", fill=(0, 0, 0))
+        else:
+            xs = [c[0] for c in coords]
+            ys = [c[1] for c in coords]
+            min_x, max_x = min(xs), max(xs)
+            min_y, max_y = min(ys), max(ys)
+
+            dx = max(max_x - min_x, 1e-9)
+            dy = max(max_y - min_y, 1e-9)
+
+            def project(lng_val: float, lat_val: float) -> tuple[int, int]:
+                px = int((lng_val - min_x) / dx * (width - 40) + 20)
+                py = int(height - ((lat_val - min_y) / dy * (height - 40) + 20))
+                return px, py
+
+            for i in range(1, len(coords)):
+                (lng1, lat1) = coords[i - 1]
+                (lng2, lat2) = coords[i]
+                x1, y1 = project(lng1, lat1)
+                x2, y2 = project(lng2, lat2)
+                draw.line([(x1, y1), (x2, y2)], fill=line_color, width=4)
+
+            x0, y0 = project(coords[0][0], coords[0][1])
+            x1, y1 = project(coords[-1][0], coords[-1][1])
+            draw.ellipse((x0 - 6, y0 - 6, x0 + 6, y0 + 6), fill=(0, 180, 0))
+            draw.ellipse((x1 - 6, y1 - 6, x1 + 6, y1 + 6), fill=(0, 0, 180))
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    if len(coords) < 2:
+        return _fallback()
+
+    def lonlat_to_global_px(lon_val: float, lat_val: float, zoom_val: int) -> tuple[float, float]:
+        scale = (2 ** zoom_val) * tile_size
+        x = (lon_val + 180.0) / 360.0 * scale
+        lat_rad = radians(lat_val)
+        y = (1.0 - (log(tan(lat_rad) + (1.0 / cos(lat_rad))) / pi)) / 2.0 * scale
+        return x, y
+
+    def pick_zoom(min_lon: float, max_lon: float, min_lat: float, max_lat: float) -> int:
+        pad = 40
+        for z in range(18, 1, -1):
+            x1, y1 = lonlat_to_global_px(min_lon, max_lat, z)
+            x2, y2 = lonlat_to_global_px(max_lon, min_lat, z)
+            span_x = abs(x2 - x1)
+            span_y = abs(y2 - y1)
+            if span_x <= (width - pad * 2) and span_y <= (height - pad * 2):
+                return z
+        return 2
+
+    lons = [c[0] for c in coords]
+    lats = [c[1] for c in coords]
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
+
+    zoom = pick_zoom(min_lon, max_lon, min_lat, max_lat)
+    center_lon = (min_lon + max_lon) / 2.0
+    center_lat = (min_lat + max_lat) / 2.0
+    cx, cy = lonlat_to_global_px(center_lon, center_lat, zoom)
+
+    top_left_x = cx - (width / 2.0)
+    top_left_y = cy - (height / 2.0)
+
+    canvas = Image.new("RGB", (width, height), (245, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+
+    x_start = int(top_left_x // tile_size)
+    y_start = int(top_left_y // tile_size)
+    x_end = int((top_left_x + width) // tile_size)
+    y_end = int((top_left_y + height) // tile_size)
+
+    n = 2 ** zoom
+    success_tiles = 0
+    for tx in range(x_start, x_end + 1):
+        for ty in range(y_start, y_end + 1):
+            if ty < 0 or ty >= n:
+                continue
+            wrapped_tx = tx % n
+            url = f"https://tile.openstreetmap.org/{zoom}/{wrapped_tx}/{ty}.png"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "IVS-TripReport/1.0"})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    tile_data = resp.read()
+                tile_img = Image.open(io.BytesIO(tile_data)).convert("RGB")
+                paste_x = int(tx * tile_size - top_left_x)
+                paste_y = int(ty * tile_size - top_left_y)
+                canvas.paste(tile_img, (paste_x, paste_y))
+                success_tiles += 1
+            except Exception:
+                continue
+
+    if success_tiles == 0:
+        return _fallback()
+
+    # Draw route overlay.
+    points: list[tuple[float, float]] = []
+    for lon_val, lat_val in coords:
+        gx, gy = lonlat_to_global_px(lon_val, lat_val, zoom)
+        points.append((gx - top_left_x, gy - top_left_y))
+
+    if len(points) >= 2:
+        draw.line(points, fill=line_color, width=4)
+        sx, sy = points[0]
+        ex, ey = points[-1]
+        draw.ellipse((sx - 6, sy - 6, sx + 6, sy + 6), fill=(0, 180, 0))
+        draw.ellipse((ex - 6, ey - 6, ex + 6, ey + 6), fill=(0, 0, 180))
+
+    draw.rectangle((0, height - 18, width, height), fill=(255, 255, 255))
+    draw.text((8, height - 14), "Map data © OpenStreetMap contributors", fill=(80, 80, 80))
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+@app.get("/trip/<trip_id>/download")
+def download_trip_json(trip_id: str):
+    """Level-3: download full trip JSON (path + events + timestamps)."""
+    try:
+        trip, err = _get_trip_or_404(trip_id)
+        if err:
+            return err
+
+        events = _build_consolidated_trip_events(trip)
+        payload = {
+            "trip_id": trip.get("trip_id"),
+            "driver_id": trip.get("driver_id"),
+            "start_time": _normalize_timestamp(trip.get("start_time") or trip.get("start")),
+            "end_time": _normalize_timestamp(trip.get("end_time") or trip.get("end")),
+            "path": trip.get("path", []) or [],
+            "events": events,
+            "risk_summary": {
+                "risk_level": trip.get("risk_level"),
+                "risk_score": trip.get("risk_score"),
+                "max_speed": compute_max_speed(trip),
+            },
+        }
+        return jsonify(payload), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/trip/<trip_id>/download_csv")
+def download_trip_csv(trip_id: str):
+    """Level-3: export path as CSV."""
+    try:
+        trip, err = _get_trip_or_404(trip_id)
+        if err:
+            return err
+
+        path = trip.get("path", []) or []
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["lat", "lng", "timestamp"])
+        for pt in path:
+            writer.writerow(
+                [
+                    pt.get("lat"),
+                    pt.get("lng", pt.get("lon")),
+                    pt.get("timestamp"),
+                ]
+            )
+
+        csv_bytes = buf.getvalue().encode("utf-8")
+        return Response(
+            csv_bytes,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={trip_id}.csv"},
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/trip/<trip_id>/map_image")
+def download_trip_map_image(trip_id: str):
+    """Level-3: download a static PNG map image of the route."""
+    try:
+        trip, err = _get_trip_or_404(trip_id)
+        if err:
+            return err
+
+        path = trip.get("path", []) or []
+        png_bytes = _render_route_png(path)
+        return Response(
+            png_bytes,
+            mimetype="image/png",
+            headers={"Content-Disposition": f"attachment; filename={trip_id}_map.png"},
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/trip/<trip_id>/report")
+def download_trip_report_pdf(trip_id: str):
+    """Level-3: generate and download a full PDF report."""
+    try:
+        trip, err = _get_trip_or_404(trip_id)
+        if err:
+            return err
+
+        events = _build_consolidated_trip_events(trip)
+        path = trip.get("path", []) or []
+
+        # Event counts for the PDF summary.
+        drowsiness_count = 0
+        yawning_count = 0
+        distraction_count = 0
+        ai_events_count = 0
+        for ai_event in trip.get("ai_events", []) or []:
+            ai_events_count += 1
+            labels = _extract_detection_labels(ai_event.get("detections", []))
+            if "drowsiness" in labels:
+                drowsiness_count += 1
+            if "yawning" in labels:
+                yawning_count += 1
+            if "distraction" in labels:
+                distraction_count += 1
+
+        sos_count = len(trip.get("sos_events", []) or [])
+
+        peak_risk_level = trip.get("risk_level", "UNKNOWN")
+        total_distance_km = compute_trip_distance_km(path)
+
+        png_bytes = _render_route_png(path)
+        try:
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.utils import ImageReader
+        except Exception as e:
+            return jsonify({"error": f"reportlab not available: {e}"}), 501
+
+        pdf_buf = io.BytesIO()
+        c = canvas.Canvas(pdf_buf, pagesize=A4)
+        page_w, page_h = A4
+
+        y = page_h - 60
+        c.setFont("Helvetica-Bold", 16)
+        c.drawString(60, y, "IVS Trip Report")
+        y -= 28
+
+        c.setFont("Helvetica", 11)
+        c.drawString(60, y, f"Trip ID: {trip_id}")
+        y -= 16
+        c.drawString(60, y, f"Driver ID: {trip.get('driver_id')}")
+        y -= 16
+        c.drawString(60, y, f"Start: {_normalize_timestamp(trip.get('start_time') or trip.get('start'))}")
+        y -= 16
+        c.drawString(60, y, f"End: {_normalize_timestamp(trip.get('end_time') or trip.get('end'))}")
+        y -= 16
+        c.drawString(60, y, f"Total Distance (km): {round(total_distance_km, 2)}")
+        y -= 16
+        c.drawString(60, y, f"Risk Level: {peak_risk_level}")
+        y -= 28
+
+        # Event summary.
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(60, y, "Event Summary")
+        y -= 18
+        c.setFont("Helvetica", 11)
+        c.drawString(60, y, f"Drowsiness events: {drowsiness_count}")
+        y -= 14
+        c.drawString(60, y, f"Yawning events: {yawning_count}")
+        y -= 14
+        c.drawString(60, y, f"Distraction events: {distraction_count}")
+        y -= 14
+        c.drawString(60, y, f"SOS events: {sos_count}")
+        y -= 18
+        c.drawString(60, y, f"AI events recorded: {ai_events_count}")
+        y -= 28
+
+        # Embed map image.
+        try:
+            img = ImageReader(io.BytesIO(png_bytes))
+            img_w = 420
+            img_h = 210
+            c.drawImage(img, 60, y - img_h, width=img_w, height=img_h, preserveAspectRatio=True, mask="auto")
+            y -= (img_h + 18)
+        except Exception:
+            y -= 20
+
+        # Timeline (first N to keep page readable).
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(60, y, "Recent Events")
+        y -= 18
+        c.setFont("Helvetica", 9)
+
+        for evt in events[:18]:
+            ts = evt.get("timestamp") or ""
+            label = evt.get("type") or ""
+            line = f"{ts}: {label}"
+            # crude line wrap protection
+            if y < 50:
+                c.showPage()
+                y = page_h - 60
+                c.setFont("Helvetica", 9)
+            c.drawString(60, y, line[:130])
+            y -= 12
+
+        c.showPage()
+        c.save()
+
+        pdf_bytes = pdf_buf.getvalue()
+        return Response(
+            pdf_bytes,
+            mimetype="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={trip_id}_report.pdf"},
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.post("/trips/<trip_id>/ai-results")
 def add_ai_result(trip_id):
     """Receive AI-engine detection/risk result and attach it to trip record."""
@@ -301,23 +764,46 @@ def add_ai_result(trip_id):
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
 
+        if trip.get("status") != "ACTIVE":
+            return jsonify(
+                {
+                    "error": "Trip is not active",
+                    "code": "TRIP_NOT_ACTIVE",
+                    "status": trip.get("status"),
+                }
+            ), 409
+
         payload = request.get_json(silent=True) or {}
+
+        detections = payload.get("detections", [])
+        labels = _extract_detection_labels(detections)
+        event_type = payload.get("event_type")
+        if not event_type or event_type in {"DETECTION", "AI Detection", "AI_DETECTION"}:
+            # Store a stable primary label; the full list is in event_labels.
+            event_type = labels[0] if labels else "DETECTION"
 
         event = {
             "timestamp": payload.get("timestamp") or datetime.utcnow().isoformat(),
-            "detections": payload.get("detections", []),
+            "event_type": event_type,
+            "event_labels": labels,
+            "detections": detections,
             "risk_score": payload.get("risk_score"),
+            "risk_score_temporal": payload.get("risk_score_temporal"),
+            "risk_score_weighted": payload.get("risk_score_weighted"),
             "risk_level": payload.get("risk_level", "UNKNOWN"),
+            "risk_level_temporal": payload.get("risk_level_temporal"),
+            "risk_level_weighted": payload.get("risk_level_weighted"),
             "reasons": payload.get("reasons", []),
+            "sos_triggered": bool(payload.get("sos_triggered", False)),
             "metadata": payload.get("metadata", {}),
-            "source": "ai_engine"
+            "source": "ai_engine",
         }
 
         update_doc = {
             "$set": {
                 "risk_score": payload.get("risk_score"),
                 "risk_level": payload.get("risk_level", "UNKNOWN"),
-                "last_ai_update": datetime.utcnow()
+                "last_ai_update": datetime.utcnow(),
             },
             "$push": {
                 "ai_events": event
@@ -386,6 +872,7 @@ def add_sos_event(trip_id):
             "location": payload.get("location", payload.get("metadata", {}).get("location", {})),
             "detections": payload.get("detections", {}),
             "risk_score_weighted": payload.get("risk_score_weighted"),
+            "risk_level": payload.get("risk_level"),
             "metadata": payload.get("metadata", {}),
             "received_at": datetime.utcnow()
         }
@@ -483,7 +970,7 @@ def add_location(trip_id):
         # Get location data from request
         location_data = request.json
         
-        # Validate required fields
+        # Validate required fields (speed optional — some clients send lat/lon/timestamp only)
         required_fields = ["latitude", "longitude", "timestamp"]
         for field in required_fields:
             if field not in location_data:
@@ -491,11 +978,12 @@ def add_location(trip_id):
         
         # Create location point
         location_point = {
-        "lat": location_data["latitude"],
-        "lon": location_data["longitude"],
-        "speed": location_data["speed"],
-        "timestamp": location_data["timestamp"]
-    }
+            "lat": location_data["latitude"],
+            "lng": location_data["longitude"],
+            "lon": location_data["longitude"],
+            "speed": location_data.get("speed", 0),
+            "timestamp": location_data["timestamp"],
+        }
         
         # Append location to path array using $push (append, never overwrite)
         result = trips_collection.update_one(
@@ -693,6 +1181,66 @@ def get_active_trip_distance():
         return jsonify({"error": str(e)}), 500
 
 
+@app.get("/trips/active-trip/live_map")
+def get_active_trip_live_map():
+    """Return live map data for the currently active trip."""
+    try:
+        trip = trips_collection.find_one({"status": "ACTIVE"}, sort=[("start_time", -1)])
+        if not trip:
+            return jsonify(
+                {
+                    "trip_active": False,
+                    "current_location": None,
+                    "path": [],
+                }
+            ), 200
+
+        path = trip.get("path", []) or []
+        current_point = path[-1] if path else {}
+
+        lat = current_point.get("lat")
+        lng = current_point.get("lng", current_point.get("lon"))
+
+        return jsonify(
+            {
+                "trip_active": True,
+                "current_location": {"lat": lat, "lng": lng} if lat is not None and lng is not None else None,
+                "path": path,
+                "trip_id": trip.get("trip_id"),
+            }
+        ), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.get("/trips/<trip_id>/live_map")
+def get_trip_live_map(trip_id):
+    """Live map payload for a specific trip (same shape as active-trip live_map when trip is ACTIVE)."""
+    try:
+        trip = trips_collection.find_one({"trip_id": trip_id})
+        if not trip:
+            return jsonify({"error": "Trip not found"}), 404
+
+        active = trip.get("status") == "ACTIVE"
+        path = trip.get("path", []) or []
+        current_point = path[-1] if path else {}
+        lat = current_point.get("lat")
+        lng = current_point.get("lng", current_point.get("lon"))
+
+        return jsonify(
+            {
+                "trip_active": active,
+                "trip_id": trip.get("trip_id"),
+                "current_location": {"lat": lat, "lng": lng}
+                if active and lat is not None and lng is not None
+                else None,
+                "path": path,
+            }
+        ), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.get("/is-active-trip/<trip_id>")
 def is_active_trip(trip_id):
     """Check if trip is currently active."""
@@ -717,16 +1265,47 @@ def add_event():
     try:
         payload = request.get_json(silent=True) or {}
         
+        detections = payload.get("detections", {})
+        labels = _extract_detection_labels(detections)
+        incoming_type_raw = (payload.get("event_type") or "").strip()
+        is_sos = bool(payload.get("is_sos", False))
+        is_generic_type = (not incoming_type_raw) or (incoming_type_raw in {"DETECTION", "AI Detection", "AI_DETECTION"})
+
+        # Avoid flooding with empty frames - only store if there's actual content
+        risk_lvl = str(payload.get("risk_level") or "").upper()
+        risk_w = payload.get("risk_score_weighted")
+        try:
+            risk_w_f = float(risk_w) if risk_w is not None else 0.0
+        except (TypeError, ValueError):
+            risk_w_f = 0.0
+        meaningful_risk = risk_lvl in {"MODERATE", "HIGH", "CRITICAL"} or risk_w_f >= 21.0
+
+        # Reject empty frames: no labels, no SOS, generic type, and no meaningful risk
+        if (not labels) and (not is_sos) and is_generic_type and (not meaningful_risk):
+            return jsonify({"message": "No detections; event skipped"}), 200
+        
+        # Additional strict check: if completely empty and not SOS/high-risk, skip it
+        has_meaningful_data = bool(labels) or is_sos or meaningful_risk
+        if not has_meaningful_data and is_generic_type:
+            return jsonify({"message": "No meaningful data; event skipped"}), 200
+
+        incoming_type = incoming_type_raw
+        if is_generic_type:
+            # Prefer a stable primary label; keep full list in event_labels.
+            incoming_type = labels[0] if labels else "DETECTION"
+
         event = {
             "event_id": str(uuid.uuid4()),
+            "trip_id": payload.get("trip_id"),
             "timestamp": payload.get("timestamp") or datetime.utcnow().isoformat(),
-            "event_type": payload.get("event_type", "DETECTION"),
-            "detections": payload.get("detections", {}),
+            "event_type": incoming_type,
+            "event_labels": labels,
+            "detections": detections,
             "risk_score_temporal": payload.get("risk_score_temporal"),
             "risk_score_weighted": payload.get("risk_score_weighted"),
             "risk_level": payload.get("risk_level"),
             "reasons": payload.get("reasons", []),
-            "is_sos": payload.get("is_sos", False),
+            "is_sos": is_sos,
             "metadata": payload.get("metadata", {}),
             "received_at": datetime.utcnow()
         }
@@ -748,18 +1327,80 @@ def get_events():
     try:
         limit = request.args.get("limit", 100, type=int)
         skip = request.args.get("skip", 0, type=int)
-        
-        events = list(events_collection.find()
-                     .sort("timestamp", -1)
-                     .skip(skip)
-                     .limit(limit))
+
+        risk_level = request.args.get("risk_level")
+        event_type = request.args.get("event_type")
+        start = request.args.get("start")
+        end = request.args.get("end")
+        # Default to including empty records to preserve prior UI behavior.
+        # Clients can request include_empty=0 to show only meaningful detections.
+        include_empty = str(request.args.get("include_empty", "1")).lower() in {"1", "true", "yes"}
+
+        query = {}
+        if risk_level:
+            query["risk_level"] = risk_level
+        if event_type:
+            query["$or"] = [
+                {"event_type": event_type},
+                {"event_labels": event_type},
+                {"detections.type": event_type},
+                {"detections": event_type},
+            ]
+
+        # By default, suppress empty background frames (no detections) so the list shows actual events.
+        if not include_empty:
+            non_empty_clause = {
+                "$or": [
+                    {"detections.0": {"$exists": True}},
+                    {"is_sos": True},
+                    {"event_type": {"$nin": ["DETECTION", "AI Detection", "AI_DETECTION"]}},
+                ]
+            }
+            if "$and" in query:
+                query["$and"].append(non_empty_clause)
+            else:
+                query["$and"] = [non_empty_clause]
+
+        start_dt = _parse_iso_to_utc_naive(start)
+        end_dt = _parse_iso_to_utc_naive(end)
+        if start_dt or end_dt:
+            ra = {}
+            if start_dt:
+                ra["$gte"] = start_dt
+            if end_dt:
+                ra["$lt"] = end_dt
+            query["received_at"] = ra
+
+        # Sort by server-side receipt time (datetime) to avoid mixed-type timestamp sorting issues
+        # (some older docs may have timestamp stored as string vs datetime).
+        # Sort newest first (descending order by received_at, then timestamp)
+        events = list(
+            events_collection.find(query)
+            .sort([("received_at", -1), ("timestamp", -1)])
+            .skip(skip)
+            .limit(limit)
+        )
         
         for event in events:
             event["_id"] = str(event["_id"])
+
+            existing_labels = event.get("event_labels")
+            derived_labels = _extract_detection_labels(event.get("detections"))
+            labels = existing_labels or derived_labels or []
+            event["event_labels"] = labels
+
+            # Ensure every event has a meaningful name in the response payload.
+            raw_type = str(event.get("event_type") or "").strip()
+            is_generic = (not raw_type) or (raw_type in {"DETECTION", "AI Detection", "AI_DETECTION", "Multiple"})
+            if labels:
+                event["event_type"] = ", ".join(labels) if len(labels) > 1 else labels[0]
+            elif is_generic:
+                event["event_type"] = "No Detections"
+
             event["timestamp"] = to_ist_display(event.get("timestamp"))
             event["received_at"] = to_ist_display(event.get("received_at"))
         
-        total_count = events_collection.count_documents({})
+        total_count = events_collection.count_documents(query)
         
         return jsonify({
             "events": events,
@@ -849,28 +1490,6 @@ def get_driver_calibration_status(driver_id):
         return jsonify({"error": str(e)}), 500
 
 
-@app.post("/drivers/<driver_id>/calibration/update")
-def update_driver_calibration(driver_id):
-    """Update calibration with new frame metrics (called by AI engine during auto-calibration)."""
-    try:
-        payload = request.get_json(silent=True) or {}
-        frame_metrics = payload.get("metrics", {})
-        
-        # Add samples to driver's calibration
-        update_calibration_samples(driver_id, frame_metrics)
-        
-        cal = get_driver_calibration(driver_id)
-        
-        return jsonify({
-            "driver_id": driver_id,
-            "frames_collected": cal.get("frames_collected", 0),
-            "calibration_status": cal.get("calibration_status"),
-            "is_calibrated": cal.get("is_calibrated")
-        }), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.get("/drivers/<driver_id>/thresholds")
 def get_driver_thresholds(driver_id):
     """Get personalized thresholds for a driver."""
@@ -885,6 +1504,111 @@ def get_driver_thresholds(driver_id):
             "driver_id": driver_id,
             "thresholds": thresholds
         }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/drivers/<driver_id>/calibration/frames")
+def submit_calibration_frames(driver_id):
+    """
+    Receive calibration frame metrics from AI engine and update driver calibration.
+    
+    Payload: {
+        "calibration_phase": "neutral|eyes_closed|yawning|head_turn",
+        "metrics": [{"ear": 0.4, "mar": 0.1, "yaw_angle": 5}, ...]
+    }
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        phase = payload.get("calibration_phase", "neutral")
+        metrics_list = payload.get("metrics", [])
+        
+        if not metrics_list:
+            return jsonify({"error": "No metrics provided"}), 400
+        
+        # Ensure calibration doc exists
+        if not get_driver_calibration(driver_id):
+            create_driver_calibration(driver_id)
+        
+        # Map phase to sample fields
+        phase_mapping = {
+            "neutral": ("head_straight_samples", "ear_open_samples", "mar_closed_samples"),
+            "eyes_closed": ("head_straight_samples", "ear_closed_samples", "mar_closed_samples"),
+            "yawning": ("head_straight_samples", "ear_open_samples", "mar_open_samples"),
+            "head_turn": ("head_turned_samples", "ear_open_samples", "mar_closed_samples"),
+        }
+        
+        if phase not in phase_mapping:
+            return jsonify({"error": f"Unknown phase: {phase}"}), 400
+        
+        head_field, ear_field, mar_field = phase_mapping[phase]
+        
+        # Extract metrics and add to calibration
+        ear_values = []
+        mar_values = []
+        yaw_values = []
+        
+        for metric in metrics_list:
+            if isinstance(metric, dict):
+                try:
+                    ear = float(metric.get("ear", 0))
+                    mar = float(metric.get("mar", 0))
+                    yaw = float(metric.get("yaw_angle", 0))
+                    if ear > 0: ear_values.append(ear)
+                    if mar > 0: mar_values.append(mar)
+                    yaw_values.append(yaw)
+                except (TypeError, ValueError):
+                    continue
+        
+        # Update calibration document
+        update_doc = {
+            "$push": {}
+        }
+        
+        if ear_values:
+            update_doc["$push"][ear_field] = {"$each": ear_values}
+        if mar_values:
+            update_doc["$push"][mar_field] = {"$each": mar_values}
+        if yaw_values:
+            update_doc["$push"][head_field] = {"$each": yaw_values}
+        
+        update_doc["$set"] = {
+            "calibration_status": "IN_PROGRESS",
+            "last_updated": datetime.utcnow().isoformat()
+        }
+        
+        calibration_collection.update_one(
+            {"driver_id": driver_id},
+            update_doc
+        )
+        
+        return jsonify({
+            "message": "Calibration frames received",
+            "driver_id": driver_id,
+            "phase": phase,
+            "frames_added": len(metrics_list)
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/drivers/<driver_id>/calibration/compute")
+def compute_driver_thresholds(driver_id):
+    """
+    Compute personalized thresholds from collected calibration samples.
+    Called when enough samples have been collected.
+    """
+    try:
+        thresholds = compute_and_store_thresholds(driver_id)
+        
+        return jsonify({
+            "message": "Thresholds computed successfully",
+            "driver_id": driver_id,
+            "thresholds": thresholds,
+            "is_calibrated": True
+        }), 200
+        
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

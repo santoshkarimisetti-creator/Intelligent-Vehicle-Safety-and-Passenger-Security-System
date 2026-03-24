@@ -1,5 +1,7 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react'
+import React, { useState, useEffect, useMemo } from 'react'
 import '../styles/events.css'
+
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
 
 export default function EventsPage() {
   const [events, setEvents] = useState([])
@@ -7,151 +9,122 @@ export default function EventsPage() {
   const [error, setError] = useState(null)
   const [selectedRiskLevel, setSelectedRiskLevel] = useState('')
   const [selectedEventType, setSelectedEventType] = useState('')
+  const [datePreset, setDatePreset] = useState('') // '', 'today', 'yesterday', 'custom'
+  const [fromDate, setFromDate] = useState('')
+  const [toDate, setToDate] = useState('')
   const [pageNum, setPageNum] = useState(1)
+  const [totalCount, setTotalCount] = useState(0)
   const itemsPerPage = 10
-
-  const audioContextRef = useRef(null)
-  const oscillatorRef = useRef(null)
-  const gainNodeRef = useRef(null)
-  const alertTimeoutRef = useRef(null)
-
-  // Initialize Web Audio API
-  useEffect(() => {
-    if (!audioContextRef.current) {
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)()
-    }
-  }, [])
-
-  // Play sound alert based on risk level
-  const playAlert = (level) => {
-    if (!audioContextRef.current) return
-
-    // Stop any existing sound
-    if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current)
-    if (oscillatorRef.current) {
-      try {
-        oscillatorRef.current.stop()
-        oscillatorRef.current.disconnect()
-      } catch (e) {}
-    }
-    if (gainNodeRef.current) {
-      try {
-        gainNodeRef.current.disconnect()
-      } catch (e) {}
-    }
-
-    const ctx = audioContextRef.current
-
-    switch (level) {
-      case 'MODERATE': {
-        // Warning beep
-        const osc = ctx.createOscillator()
-        const gain = ctx.createGain()
-        osc.connect(gain)
-        gain.connect(ctx.destination)
-        osc.frequency.value = 800
-        osc.type = 'sine'
-        gain.gain.setValueAtTime(0.3, ctx.currentTime)
-        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5)
-        osc.start(ctx.currentTime)
-        osc.stop(ctx.currentTime + 0.5)
-        oscillatorRef.current = osc
-        break
-      }
-      case 'HIGH': {
-        // Pulsing alert (3 pulses)
-        let pulseCount = 0
-        const playPulse = () => {
-          if (pulseCount >= 3) return
-          const osc = ctx.createOscillator()
-          const gain = ctx.createGain()
-          osc.connect(gain)
-          gain.connect(ctx.destination)
-          osc.frequency.value = 1000
-          osc.type = 'square'
-          gain.gain.setValueAtTime(0.2, ctx.currentTime)
-          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15)
-          osc.start(ctx.currentTime)
-          osc.stop(ctx.currentTime + 0.15)
-          pulseCount++
-          alertTimeoutRef.current = setTimeout(playPulse, 200)
-        }
-        playPulse()
-        break
-      }
-      case 'CRITICAL': {
-        // Continuous alarm (3 cycles)
-        let cycleCount = 0
-        const playCycle = () => {
-          if (cycleCount >= 3) return
-          const osc = ctx.createOscillator()
-          const gain = ctx.createGain()
-          osc.connect(gain)
-          gain.connect(ctx.destination)
-          osc.frequency.setValueAtTime(1200, ctx.currentTime)
-          osc.frequency.exponentialRampToValueAtTime(800, ctx.currentTime + 0.3)
-          osc.type = 'square'
-          gain.gain.setValueAtTime(0.25, ctx.currentTime)
-          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3)
-          osc.start(ctx.currentTime)
-          osc.stop(ctx.currentTime + 0.3)
-          cycleCount++
-          alertTimeoutRef.current = setTimeout(playCycle, 400)
-        }
-        playCycle()
-        break
-      }
-      default:
-        break
-    }
-  }
-
-  // Trigger sound when high-risk event appears
-  useEffect(() => {
-    if (events.length > 0) {
-      const highestRisk = events[0]?.risk_level
-      if (highestRisk === 'HIGH' || highestRisk === 'CRITICAL') {
-        playAlert(highestRisk)
-      } else if (highestRisk === 'MODERATE') {
-        playAlert('MODERATE')
-      }
-    }
-  }, [events])
 
   useEffect(() => {
     const fetchEvents = async () => {
       try {
         setLoading(true)
-        const response = await fetch(`http://localhost:5000/events?limit=${itemsPerPage}&skip=${(pageNum - 1) * itemsPerPage}`)
+
+        const params = new URLSearchParams({
+          limit: String(itemsPerPage),
+          skip: String((pageNum - 1) * itemsPerPage),
+        })
+
+        if (selectedRiskLevel) params.set('risk_level', selectedRiskLevel)
+        if (selectedEventType) params.set('event_type', selectedEventType)
+
+        const now = new Date()
+        const startOfDay = (d) => new Date(d.getFullYear(), d.getMonth(), d.getDate())
+
+        let start = null
+        let end = null
+        if (datePreset === 'today') {
+          start = startOfDay(now)
+          end = new Date(start)
+          end.setDate(end.getDate() + 1)
+        } else if (datePreset === 'yesterday') {
+          start = startOfDay(now)
+          start.setDate(start.getDate() - 1)
+          end = new Date(start)
+          end.setDate(end.getDate() + 1)
+        } else if (datePreset === 'custom' && fromDate) {
+          start = new Date(`${fromDate}T00:00:00`)
+          if (toDate) {
+            end = new Date(`${toDate}T00:00:00`)
+            end.setDate(end.getDate() + 1)
+          } else {
+            end = new Date(start)
+            end.setDate(end.getDate() + 1)
+          }
+        }
+        if (start) params.set('start', start.toISOString())
+        if (end) params.set('end', end.toISOString())
+
+        const response = await fetch(`${API_BASE}/events?${params.toString()}`)
         if (!response.ok) throw new Error('Failed to fetch events')
         const data = await response.json()
-        setEvents(data.events || [])
+        const list = Array.isArray(data.events) ? data.events.slice() : []
+        list.sort((a, b) => {
+          const at = a?.received_at ? new Date(a.received_at).getTime() : (a?.timestamp ? new Date(a.timestamp).getTime() : 0)
+          const bt = b?.received_at ? new Date(b.received_at).getTime() : (b?.timestamp ? new Date(b.timestamp).getTime() : 0)
+          return bt - at
+        })
+        setEvents(list)
+        setTotalCount(data.total_count || 0)
         setError(null)
       } catch (err) {
         setError(err.message)
         setEvents([])
+        setTotalCount(0)
       } finally {
         setLoading(false)
       }
     }
     fetchEvents()
-  }, [pageNum])
+  }, [pageNum, selectedRiskLevel, selectedEventType, datePreset, fromDate, toDate])
 
-  const filtered = useMemo(() => {
-    let result = events
+  const _extractLabels = (event) => {
+    const detections = event?.event_labels || event?.detections
+    const labels = []
 
-    if (selectedRiskLevel) {
-      result = result.filter(e => e.risk_level === selectedRiskLevel)
+    if (Array.isArray(detections)) {
+      for (const d of detections) {
+        if (typeof d === 'string') {
+          if (d.trim()) labels.push(d.trim())
+        } else if (d && typeof d === 'object') {
+          const label = d.type || d.label || d.name || d.event
+          if (label) labels.push(String(label))
+        }
+      }
+    } else if (detections && typeof detections === 'object') {
+      for (const [k, v] of Object.entries(detections)) {
+        if (v) labels.push(k)
+      }
     }
 
-    if (selectedEventType) {
-      result = result.filter(e => e.event_type === selectedEventType)
+    return [...new Set(labels.filter(Boolean))]
+  }
+
+  const getEventLabel = (event) => {
+    const raw = (event?.event_type || '').trim()
+    const labels = _extractLabels(event)
+
+    // If we have multiple labels, always prefer showing them.
+    if (labels.length > 1) return labels.join(', ')
+
+    // If backend gave a meaningful type, use it.
+    if (raw && raw !== 'DETECTION' && raw !== 'AI Detection') return raw
+
+    const uniq = labels
+    if (uniq.length === 1) return uniq[0]
+    return 'Detection'
+  }
+
+  const eventTypes = useMemo(() => {
+    const labels = []
+    for (const e of events) {
+      for (const l of _extractLabels(e)) labels.push(l)
     }
+    return [...new Set(labels.filter(Boolean))]
+  }, [events])
 
-    return result
-  }, [events, selectedRiskLevel, selectedEventType])
-
-  const eventTypes = [...new Set(events.map(e => e.event_type).filter(Boolean))]
+  const totalPages = Math.max(1, Math.ceil((totalCount || 0) / itemsPerPage))
   const riskLevels = ['SAFE', 'MODERATE', 'HIGH', 'CRITICAL']
 
   const formatTimestamp = (ts) => {
@@ -226,22 +199,59 @@ export default function EventsPage() {
             <option key={type} value={type}>{type}</option>
           ))}
         </select>
+
+        <select
+          value={datePreset}
+          onChange={e => {
+            setDatePreset(e.target.value)
+            setPageNum(1)
+          }}
+          className="filter-select"
+        >
+          <option value="">All Dates</option>
+          <option value="today">Today</option>
+          <option value="yesterday">Yesterday</option>
+          <option value="custom">Custom</option>
+        </select>
+
+        {datePreset === 'custom' && (
+          <>
+            <input
+              type="date"
+              value={fromDate}
+              onChange={e => {
+                setFromDate(e.target.value)
+                setPageNum(1)
+              }}
+              className="filter-select"
+            />
+            <input
+              type="date"
+              value={toDate}
+              onChange={e => {
+                setToDate(e.target.value)
+                setPageNum(1)
+              }}
+              className="filter-select"
+            />
+          </>
+        )}
       </div>
 
       {loading && <div className="loading">Loading events...</div>}
       {error && <div className="error">Error: {error}</div>}
 
-      {!loading && filtered.length === 0 && (
+      {!loading && events.length === 0 && (
         <div className="no-data">No events found</div>
       )}
 
-      {!loading && filtered.length > 0 && (
+      {!loading && events.length > 0 && (
         <>
           <div className="events-list">
-            {filtered.map(event => (
+            {events.map(event => (
               <div key={event._id} className="event-card">
                 <div className="event-header">
-                  <h3>{event.event_type || 'Unknown Event'}</h3>
+                  <h3>{getEventLabel(event)}</h3>
                   <span 
                     className="risk-badge" 
                     style={{ backgroundColor: getRiskColor(event.risk_level) }}
@@ -258,15 +268,30 @@ export default function EventsPage() {
                   )}
                 </div>
 
-                {event.detections && Object.keys(event.detections).length > 0 && (
+                {event.detections && ((Array.isArray(event.detections) && event.detections.length > 0) || (!Array.isArray(event.detections) && Object.keys(event.detections).length > 0)) && (
                   <div className="event-detections">
                     <strong>Detections:</strong>
                     <ul>
-                      {Object.entries(event.detections).map(([key, val]) => (
-                        <li key={key}>
-                          {key}: <span className="detection-value">{val}</span>
-                        </li>
-                      ))}
+                      {Array.isArray(event.detections)
+                        ? event.detections.map((d, idx) => {
+                            if (typeof d === 'string') {
+                              return (
+                                <li key={`${d}-${idx}`}>
+                                  {d}
+                                </li>
+                              )
+                            }
+                            return (
+                              <li key={`${d?.type || 'detection'}-${idx}`}>
+                                {d?.type || 'unknown'}: <span className="detection-value">{d?.confidence != null ? `${Math.round(d.confidence * 100)}%` : 'N/A'}</span>
+                              </li>
+                            )
+                          })
+                        : Object.entries(event.detections).map(([key, val]) => (
+                            <li key={key}>
+                              {key}: <span className="detection-value">{typeof val === 'object' ? JSON.stringify(val) : String(val)}</span>
+                            </li>
+                          ))}
                     </ul>
                   </div>
                 )}
@@ -288,10 +313,21 @@ export default function EventsPage() {
             >
               Previous
             </button>
-            <span className="page-info">Page {pageNum}</span>
+            <span className="page-info">Page {pageNum} / {totalPages}</span>
+
+            {Array.from({ length: totalPages }, (_, i) => i + 1).map(p => (
+              <button
+                key={p}
+                onClick={() => setPageNum(p)}
+                disabled={p === pageNum}
+                className="pagination-btn pagination-page-btn"
+              >
+                {p}
+              </button>
+            ))}
             <button 
               onClick={() => setPageNum(pageNum + 1)}
-              disabled={filtered.length < itemsPerPage}
+              disabled={pageNum >= totalPages}
               className="pagination-btn"
             >
               Next
