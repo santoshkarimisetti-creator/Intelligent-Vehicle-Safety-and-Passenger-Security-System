@@ -12,9 +12,11 @@ ai_engine/face_landmarker.task
 venv/
 env/
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.py[cod]
 .Python
 build/
 develop-eggs/
@@ -83,6 +85,7 @@ temp/
 tmp/
 logs/
 *.log
+.rollback_backup_*/
 .pytest_cache/
 .coverage
 htmlcov/
@@ -97,7 +100,9 @@ backend/insert_test_sos_data.py
 
 # ===== New AI / Model Artifacts (Do NOT Commit) =====
 # DeepFace / face recognition / mediapipe downloaded models
-ai_engine/models/
+ai_engine/models/*
+!ai_engine/models/.gitkeep
+ai_engine/models/emotion_model.onnx
 ai_engine/*.onnx
 ai_engine/*.h5
 ai_engine/*.pb

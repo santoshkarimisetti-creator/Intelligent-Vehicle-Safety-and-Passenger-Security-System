@@ -4,3 +4,4 @@ opencv-python>=4.10.0
 numpy>=1.24.0,<3.0.0
 mediapipe>=0.10.0
 pymongo==4.6.1
+onnxruntime>=1.18.0
