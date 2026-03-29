@@ -1,0 +1,11 @@
+# CODEOWNERS
+# Ensure all changes require review by your account.
+# Replace @your-github-username with your actual GitHub handle.
+
+* @santoshkarimisetti
+
+# Optional examples (uncomment and adjust as needed):
+# docs/ @your-github-username
+# src/ @your-github-username
+# For org teams: use @org/team-name
+# src/frontend/ @your-org/frontend-team

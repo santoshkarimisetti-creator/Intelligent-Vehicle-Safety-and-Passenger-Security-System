@@ -2,9 +2,11 @@ import os
 import json
 import base64
 import time
+import uuid
+import threading
 import tempfile
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -32,7 +34,7 @@ from driver_session_manager import get_driver_session_manager
 from risk_engine import get_risk_engine
 
 # Emotion fusion + final decision
-from emotion_engine import get_emotion_engine
+from emotion_engine import default_emotion_result, get_emotion_engine
 from final_decision_engine import get_final_decision_engine
 from alert_engine import get_alert_engine
 
@@ -84,12 +86,221 @@ PASSENGER_SOS_DURATION_THRESH = float(os.getenv("PASSENGER_SOS_DURATION_THRESH",
 driver_thresholds_cache = {}  # {driver_id: {ear_drowsiness, mar_yawning, head_turn, cached_at}}
 THRESHOLD_CACHE_TTL = 300  # 5 minutes
 
+# Slow analytics loop configuration (runs asynchronously and periodically).
+SLOW_ANALYTICS_INTERVAL_S = float(os.getenv("SLOW_ANALYTICS_INTERVAL_S", "5.0"))
+# Identity verification is session-level and should run less frequently than frame loop.
+IDENTITY_VERIFY_INTERVAL_S = float(os.getenv("IDENTITY_VERIFY_INTERVAL_S", "12.0"))
+
+# Per-session cached analytics state; updated by background worker.
+_analytics_state: Dict[str, Dict[str, Any]] = {}
+_analytics_lock = threading.Lock()
+_episode_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
+_episode_lock = threading.Lock()
+_episode_event_types = tuple(
+    t.strip() for t in os.getenv("EPISODE_EVENT_TYPES", "yawning,distraction,driver_not_visible").split(",") if t.strip()
+)
+_episode_persist_min_s = float(os.getenv("EPISODE_PERSIST_MIN_SECONDS", "0.8"))
+_compute_risk_persist_events = str(os.getenv("COMPUTE_RISK_PERSIST_EVENTS", "0")).lower() in {"1", "true", "yes"}
+
+
+def _empty_emotion_placeholder() -> Dict[str, Any]:
+    """Placeholder for future lightweight emotion model integration."""
+    return default_emotion_result()
+
+
+def _analytics_state_defaults() -> Dict[str, Any]:
+    return {
+        "last_run_ts": 0.0,
+        "running": False,
+        "updated_at": None,
+        "identity_session": {
+            "locked": False,
+            "driver_id": None,
+            "confidence": 0.0,
+            "last_verified_ts": 0.0,
+            "last_attempt_ts": 0.0,
+            "reidentify_required": False,
+            "status": "UNVERIFIED",
+            "mismatch_count": 0,
+        },
+        "identity": {
+            "driver_id": None,
+            "confidence": 0.0,
+            "matched": False,
+        },
+        "driver": None,
+        "passengers": [],
+        "sos_gesture": {
+            "type": "sos_gesture",
+            "person": "passenger",
+            "sos_detected": False,
+            "sos_triggered": False,
+            "crossed_arms": False,
+            "duration": 0.0,
+            "hands_detected": 0,
+        },
+        "driver_emotion": {
+            "driver_emotion": "unknown",
+            "confidence": 0.0,
+            "stress_level": "LOW",
+            "timestamp": None,
+            "source": "emotion_placeholder",
+        },
+        "emotion_result": _empty_emotion_placeholder(),
+        "passenger_emotions": [],
+    }
+
+
+def _get_cached_analytics_state(session_key: str) -> Dict[str, Any]:
+    with _analytics_lock:
+        st = _analytics_state.get(session_key)
+        if st is None:
+            st = _analytics_state_defaults()
+            _analytics_state[session_key] = st
+        return dict(st)
+
 
 def _get_driver_id_from_trip(trip_id: str) -> str:
     """Extract or derive driver_id from trip_id (or use trip_id as default)."""
     # In a real system, query backend to get driver_id from trip
     # For now, use trip_id as driver identifier
     return trip_id or "unknown_driver"
+
+
+def _parse_iso_utc(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _detection_map_by_type(detections: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for d in detections or []:
+        t = str(d.get("type") or "").strip().lower()
+        if t and t not in out:
+            out[t] = d
+    return out
+
+
+def _build_episode_persistence_payloads(
+    *,
+    session_key: str,
+    trip_id: str,
+    driver_id: str,
+    detections: List[Dict[str, Any]],
+    ts_iso: str,
+    risk_result: Dict[str, Any],
+    driver_emotion_payload: Dict[str, Any],
+    metadata: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    now_dt = _parse_iso_utc(ts_iso) or datetime.now(timezone.utc)
+    det_by_type = _detection_map_by_type(detections)
+    payloads: List[Dict[str, Any]] = []
+
+    with _episode_lock:
+        session_state = _episode_state.setdefault(session_key, {})
+
+        for event_type in _episode_event_types:
+            entry = session_state.setdefault(
+                event_type,
+                {
+                    "active": False,
+                    "episode_id": None,
+                    "start_time": None,
+                    "event_key": None,
+                },
+            )
+
+            det = det_by_type.get(event_type)
+            active_now = det is not None
+            det_duration = 0.0
+            if det is not None:
+                try:
+                    det_duration = max(0.0, float(det.get("duration_s", 0.0) or 0.0))
+                except Exception:
+                    det_duration = 0.0
+
+            if active_now and not bool(entry.get("active", False)):
+                if det_duration < float(_episode_persist_min_s):
+                    continue
+
+                start_dt = now_dt - timedelta(seconds=det_duration)
+                start_iso = start_dt.isoformat()
+                episode_id = str(uuid.uuid4())
+                event_key = f"{trip_id}|{driver_id}|{event_type}|{start_iso}"
+
+                payloads.append(
+                    {
+                        "trip_id": trip_id,
+                        "timestamp": ts_iso,
+                        "source": "ai_engine",
+                        "event_action": "start",
+                        "event_type": event_type,
+                        "event_key": event_key,
+                        "episode_id": episode_id,
+                        "episode_start_ts": start_iso,
+                        "detections": [det],
+                        "risk_score_temporal": risk_result.get("risk_score_temporal"),
+                        "risk_level_temporal": risk_result.get("risk_level_temporal"),
+                        "risk_score_weighted": risk_result.get("risk_score_weighted"),
+                        "risk_level_weighted": risk_result.get("risk_level_weighted"),
+                        "risk_score": risk_result.get("risk_score_weighted"),
+                        "risk_level": risk_result.get("risk_level"),
+                        "reasons": risk_result.get("reasons", []),
+                        "driver_emotion": driver_emotion_payload,
+                        "metadata": dict(metadata),
+                    }
+                )
+
+                entry["active"] = True
+                entry["episode_id"] = episode_id
+                entry["start_time"] = start_iso
+                entry["event_key"] = event_key
+
+            elif (not active_now) and bool(entry.get("active", False)):
+                start_iso = str(entry.get("start_time") or ts_iso)
+                start_dt = _parse_iso_utc(start_iso) or now_dt
+                dur = max(0.0, (now_dt - start_dt).total_seconds())
+
+                payloads.append(
+                    {
+                        "trip_id": trip_id,
+                        "timestamp": ts_iso,
+                        "source": "ai_engine",
+                        "event_action": "end",
+                        "event_type": event_type,
+                        "event_key": entry.get("event_key"),
+                        "episode_id": entry.get("episode_id"),
+                        "episode_start_ts": start_iso,
+                        "episode_end_ts": ts_iso,
+                        "duration_s": round(dur, 3),
+                        "detections": [],
+                        "risk_score_temporal": risk_result.get("risk_score_temporal"),
+                        "risk_level_temporal": risk_result.get("risk_level_temporal"),
+                        "risk_score_weighted": risk_result.get("risk_score_weighted"),
+                        "risk_level_weighted": risk_result.get("risk_level_weighted"),
+                        "risk_score": risk_result.get("risk_score_weighted"),
+                        "risk_level": risk_result.get("risk_level"),
+                        "reasons": risk_result.get("reasons", []),
+                        "driver_emotion": driver_emotion_payload,
+                        "metadata": dict(metadata),
+                    }
+                )
+
+                entry["active"] = False
+                entry["episode_id"] = None
+                entry["start_time"] = None
+                entry["event_key"] = None
+
+    return payloads
+
+
+def _reset_episode_state(session_key: str) -> None:
+    with _episode_lock:
+        _episode_state.pop(session_key, None)
 
 
 def _get_cached_thresholds(driver_id: str) -> Dict[str, float]:
@@ -736,6 +947,249 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _build_passenger_emotions_placeholder(passenger_meta: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for idx, p in enumerate(passenger_meta or []):
+        pb = _bbox_array_to_dict(p.get("bbox") if isinstance(p, dict) else None)
+        if pb is None:
+            continue
+        out.append(
+            {
+                "passenger_index": idx,
+                "bbox": pb,
+                "dominant_emotion": "unknown",
+                "confidence": 0.0,
+                "source": "emotion_placeholder",
+            }
+        )
+    return out
+
+
+def _driver_bbox_from_faces_meta(
+    faces_meta: List[Dict[str, Any]],
+    cv_metrics: Dict[str, Any],
+) -> Optional[Dict[str, int]]:
+    driver_meta = next((m for m in (faces_meta or []) if m.get("role") == "driver"), None)
+    if isinstance(driver_meta, dict):
+        pb = _bbox_array_to_dict(driver_meta.get("bbox"))
+        if pb is not None:
+            return pb
+    return _bbox_array_to_dict(cv_metrics.get("face_bbox"))
+
+
+def _run_slow_analytics(
+    *,
+    session_key: str,
+    trip_id: str,
+    image_bgr: np.ndarray,
+    cv_metrics: Dict[str, Any],
+) -> None:
+    """Background analytics worker. Must never block fast loop."""
+    now_ts = time.time()
+    with _analytics_lock:
+        prev_state = dict(_analytics_state.get(session_key) or _analytics_state_defaults())
+
+    identity_session = dict(prev_state.get("identity_session") or {})
+    identity_payload = {
+        "driver_id": None,
+        "confidence": 0.0,
+        "matched": False,
+    }
+    driver_meta = None
+    passenger_meta: List[Dict[str, Any]] = []
+    passenger_sos = {
+        "type": "sos_gesture",
+        "person": "passenger",
+        "sos_detected": False,
+        "sos_triggered": False,
+        "crossed_arms": False,
+        "duration": 0.0,
+        "hands_detected": 0,
+    }
+
+    try:
+        faces_meta = cv_metrics.get("faces_meta", []) or []
+        driver_meta = next((m for m in faces_meta if m.get("role") == "driver"), None)
+        passenger_meta = [m for m in faces_meta if m.get("role") == "passenger"]
+        face_detected = bool(cv_metrics.get("face_detected", False))
+
+        # Slow analytics task 1: session-level identity management.
+        # - initial identification once a face is present
+        # - periodic verification every IDENTITY_VERIFY_INTERVAL_S
+        # - trigger re-identification on mismatch/failure
+        locked = bool(identity_session.get("locked", False))
+        last_verified_ts = float(identity_session.get("last_verified_ts", 0.0) or 0.0)
+        reidentify_required = bool(identity_session.get("reidentify_required", False))
+
+        should_identify = False
+        if not locked:
+            should_identify = face_detected
+        else:
+            should_identify = reidentify_required or ((now_ts - last_verified_ts) >= float(IDENTITY_VERIFY_INTERVAL_S))
+
+        if should_identify:
+            identity_service = get_face_recognition_service()
+            identity = identity_service.identify_driver(
+                image_bgr=image_bgr,
+                target_face_bbox=cv_metrics.get("face_bbox"),
+            )
+            identity_session["last_attempt_ts"] = now_ts
+
+            matched = bool(identity.matched)
+            found_driver_id = str(identity.driver_id or "").strip() or None
+            found_conf = round(float(identity.confidence), 3)
+
+            if (not locked) and matched and found_driver_id:
+                identity_session["locked"] = True
+                identity_session["driver_id"] = found_driver_id
+                identity_session["confidence"] = found_conf
+                identity_session["last_verified_ts"] = now_ts
+                identity_session["reidentify_required"] = False
+                identity_session["status"] = "VERIFIED"
+                identity_session["mismatch_count"] = 0
+            elif (not locked) and (not matched):
+                identity_session["status"] = "INITIAL_IDENTIFICATION_FAILED"
+                identity_session["reidentify_required"] = True
+            elif locked and matched and found_driver_id == identity_session.get("driver_id"):
+                identity_session["confidence"] = found_conf
+                identity_session["last_verified_ts"] = now_ts
+                identity_session["reidentify_required"] = False
+                identity_session["status"] = "VERIFIED"
+            elif locked and matched and found_driver_id and found_driver_id != identity_session.get("driver_id"):
+                identity_session["locked"] = False
+                identity_session["reidentify_required"] = True
+                identity_session["status"] = "REIDENTIFY_REQUIRED"
+                identity_session["mismatch_count"] = int(identity_session.get("mismatch_count", 0) or 0) + 1
+                identity_session["driver_id"] = None
+                identity_session["confidence"] = 0.0
+            else:
+                identity_session["locked"] = False
+                identity_session["reidentify_required"] = True
+                identity_session["status"] = "VERIFY_FAILED"
+                identity_session["driver_id"] = None
+                identity_session["confidence"] = 0.0
+
+        identity_payload = {
+            "driver_id": identity_session.get("driver_id"),
+            "confidence": float(identity_session.get("confidence", 0.0) or 0.0),
+            "matched": bool(identity_session.get("locked", False)),
+            "status": identity_session.get("status", "UNVERIFIED"),
+        }
+
+        # Slow analytics task 2: passenger monitoring and SOS gesture.
+        has_passengers = len(passenger_meta) > 0
+        passenger_sos = _detect_passenger_sos_gesture(
+            image_bgr,
+            trip_id,
+            has_passengers=has_passengers,
+            palm_open_info=None,
+        )
+
+        # Slow analytics task 3: scheduled placeholder emotion analysis.
+        passenger_bboxes = []
+        for p in passenger_meta:
+            pb = _bbox_array_to_dict(p.get("bbox") if isinstance(p, dict) else None)
+            if pb is not None:
+                passenger_bboxes.append(pb)
+
+        emotion_payload = get_emotion_engine().analyze_periodic(
+            session_key=session_key,
+            image_bgr=image_bgr,
+            driver_bbox=_driver_bbox_from_faces_meta(faces_meta, cv_metrics),
+            passenger_bboxes=passenger_bboxes if has_passengers else [],
+            force=True,
+            is_trip_active=bool(trip_id),
+        )
+    except Exception as e:
+        passenger_sos = {
+            "type": "sos_gesture",
+            "person": "passenger",
+            "sos_detected": False,
+            "sos_triggered": False,
+            "crossed_arms": False,
+            "duration": 0.0,
+            "hands_detected": 0,
+            "message": f"slow_analytics_error: {e}",
+        }
+        emotion_payload = {
+            "emotion_result": _empty_emotion_placeholder(),
+            "driver_emotion": {
+                "driver_emotion": "unknown",
+                "confidence": 0.0,
+                "stress_level": "LOW",
+                "timestamp": None,
+                "source": "emotion_placeholder",
+            },
+            "passenger_emotions": _build_passenger_emotions_placeholder(passenger_meta),
+            "reused_cached": False,
+        }
+    finally:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        emotion_result = emotion_payload.get("emotion_result", _empty_emotion_placeholder())
+        passenger_emotions = emotion_payload.get("passenger_emotions", _build_passenger_emotions_placeholder(passenger_meta))
+        driver_emotion_payload = emotion_payload.get("driver_emotion") or {
+            "driver_emotion": str(emotion_result.get("dominant_emotion") or "unknown"),
+            "confidence": float(emotion_result.get("confidence") or 0.0),
+            "stress_level": str(emotion_result.get("stress_level") or "LOW"),
+            "timestamp": emotion_result.get("timestamp"),
+            "source": "emotion_placeholder",
+        }
+        with _analytics_lock:
+            state = _analytics_state.get(session_key) or _analytics_state_defaults()
+            state["running"] = False
+            state["updated_at"] = now_iso
+            state["identity_session"] = identity_session
+            state["identity"] = identity_payload
+            state["driver"] = driver_meta
+            state["passengers"] = passenger_meta
+            state["sos_gesture"] = passenger_sos
+            state["emotion_result"] = emotion_result
+            state["driver_emotion"] = driver_emotion_payload
+            state["passenger_emotions"] = passenger_emotions
+            _analytics_state[session_key] = state
+
+
+def _schedule_slow_analytics(
+    *,
+    session_key: str,
+    trip_id: str,
+    image_bgr: Optional[np.ndarray],
+    cv_metrics: Dict[str, Any],
+) -> None:
+    """Start periodic background analytics if due. Non-blocking by design."""
+    if image_bgr is None or getattr(image_bgr, "size", 0) == 0:
+        return
+
+    now = time.time()
+    with _analytics_lock:
+        state = _analytics_state.get(session_key)
+        if state is None:
+            state = _analytics_state_defaults()
+            _analytics_state[session_key] = state
+
+        if bool(state.get("running", False)):
+            return
+        last_run_ts = float(state.get("last_run_ts", 0.0) or 0.0)
+        if (now - last_run_ts) < max(0.5, float(SLOW_ANALYTICS_INTERVAL_S)):
+            return
+
+        state["running"] = True
+        state["last_run_ts"] = now
+
+    worker = threading.Thread(
+        target=_run_slow_analytics,
+        kwargs={
+            "session_key": session_key,
+            "trip_id": trip_id,
+            "image_bgr": np.copy(image_bgr),
+            "cv_metrics": dict(cv_metrics or {}),
+        },
+        daemon=True,
+        name=f"slow-analytics-{session_key}",
+    )
+    worker.start()
+
+
 def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Compute detections from either:
@@ -754,37 +1208,29 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
         if image is not None:
             cv_metrics = _process_frame_with_landmarks(image)
 
-            # Identity layer (can inform session lock)
-            identity_service = get_face_recognition_service()
-            identity = identity_service.identify_driver(
-                image_bgr=image,
-                target_face_bbox=cv_metrics.get("face_bbox"),
-            )
-
-            # Session management: lock identity per trip/session
-            session_mgr = get_driver_session_manager()
-            sess, driver_changed, previous_driver = session_mgr.observe_identity(
+            # Read latest cached slow analytics state and schedule refresh if due.
+            cached_analytics = _get_cached_analytics_state(session_key)
+            _schedule_slow_analytics(
                 session_key=session_key,
-                fallback_driver_id=fallback_driver_id,
-                identity_driver_id=identity.driver_id,
-                identity_confidence=float(identity.confidence),
-                identity_matched=bool(identity.matched),
+                trip_id=trip_id,
+                image_bgr=image,
+                cv_metrics=cv_metrics,
             )
 
-            active_driver_id = sess.active_driver_id
+            identity_info = cached_analytics.get("identity") or {}
+            identity_session = cached_analytics.get("identity_session") or {}
+            active_driver_id = (
+                str(identity_session.get("driver_id") or identity_info.get("driver_id") or "").strip()
+                if bool(identity_session.get("locked", identity_info.get("matched", False)))
+                else ""
+            ) or fallback_driver_id
 
             # Load thresholds for the active driver (session-cached)
+            session_mgr = get_driver_session_manager()
             thresholds = session_mgr.get_thresholds(
                 session_key=session_key,
                 driver_id=active_driver_id,
             )
-
-            # If driver changed (e.g., first lock), reset temporal behavior state for the previous driver
-            if driver_changed and previous_driver:
-                try:
-                    get_behavior_engine().reset_driver(driver_id=previous_driver)
-                except Exception:
-                    pass
 
             # Temporal behavior detection (stateful) keyed by ACTIVE driver id
             behavior = get_behavior_engine().update(
@@ -797,40 +1243,16 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
                 "metrics": cv_metrics,
             }
 
-            # Multi-person monitoring output:
-            # `landmark_engine` provides `faces_meta` with per-face roles.
+            # Lightweight per-frame face roles from FaceLandmarker.
             faces_meta = cv_metrics.get("faces_meta", []) or []
-            driver_meta = next((m for m in faces_meta if m.get("role") == "driver"), None)
-            passenger_meta = [m for m in faces_meta if m.get("role") == "passenger"]
-            detection_result["driver"] = driver_meta
-            detection_result["passengers"] = passenger_meta
-            detection_result["identity"] = {
-                "driver_id": identity.driver_id,
-                "confidence": round(float(identity.confidence), 3),
-                "matched": bool(identity.matched),
-            }
+            detection_result["driver"] = next((m for m in faces_meta if m.get("role") == "driver"), None)
+            detection_result["passengers"] = [m for m in faces_meta if m.get("role") == "passenger"]
 
+            # Heavy analytics outputs are sourced from cached slow loop.
+            detection_result["identity"] = identity_info
             detection_result["session"] = session_mgr.export_session(session_key=session_key)
-
-            # Emotion detection (support signal, not a primary trigger).
-            # Only run in image-mode (we have an actual frame to analyze/crop).
-            emotion_engine = get_emotion_engine()
-            emotion_result = emotion_engine.predict_emotion(
-                image_bgr=image,
-                face_bbox=cv_metrics.get("face_bbox"),
-            )
-            detection_result["emotion"] = emotion_result
-
-            # Append emotion detection to the end so primary fatigue/distraction labels remain first.
-            emotion_risk = float(emotion_result.get("emotion_risk_score") or 0.0)
-            emotion_min_risk = float(os.getenv("EMOTION_MIN_RISK_FOR_DETECTION", "0.35"))
-            if emotion_risk >= emotion_min_risk:
-                dominant = str(emotion_result.get("dominant_emotion") or "unknown")
-                detection_result["detections"].append({
-                    "type": f"emotion_{dominant}",
-                    "confidence": round(float(emotion_result.get("confidence") or 0.0), 3),
-                    "source": "deepface",
-                })
+            detection_result["emotion"] = cached_analytics.get("emotion_result", _empty_emotion_placeholder())
+            detection_result["passenger_emotions"] = cached_analytics.get("passenger_emotions", [])
 
             # Optional: structured calibration sample submission via analyze_frame
             # (preferred flow is via /drivers/<id>/calibration/* endpoints)
@@ -854,14 +1276,16 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
                 except Exception as e:
                     detection_result["calibration"] = {"error": str(e)}
             
-            # Passenger SOS gesture (crossed arms X) only when passengers exist.
-            has_passengers = len(passenger_meta) > 0
-            passenger_sos_result = _detect_passenger_sos_gesture(
-                image,
-                trip_id,
-                has_passengers=has_passengers,
-                palm_open_info=None,
-            )
+            # Passenger SOS gesture is produced by slow analytics and reused here.
+            passenger_sos_result = cached_analytics.get("sos_gesture") or {
+                "type": "sos_gesture",
+                "person": "passenger",
+                "sos_detected": False,
+                "sos_triggered": False,
+                "crossed_arms": False,
+                "duration": 0.0,
+                "hands_detected": 0,
+            }
             
             # Add raw scores for risk computation (temporal & threshold-based)
             detection_result["raw_scores"] = behavior.get("raw_scores", {
@@ -874,7 +1298,7 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
             detection_result["personalization"] = {
                 "driver_id": active_driver_id,
                 "thresholds_used": thresholds,
-                "identity_locked": bool(sess.locked),
+                "identity_locked": bool(identity_info.get("matched", False)),
             }
             
             detection_result["sos_gesture"] = passenger_sos_result
@@ -1109,6 +1533,25 @@ def _post_sos_event_to_backend(sos_payload: Dict[str, Any]) -> Tuple[bool, str]:
         return False, str(exc)
 
 
+def _post_backend_async(
+    *,
+    result_payloads: Optional[List[Dict[str, Any]]] = None,
+    sos_event_payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Background backend persistence so /analyze_frame stays low-latency."""
+    for payload in (result_payloads or []):
+        try:
+            _post_result_to_backend(dict(payload))
+        except Exception as e:
+            print(f"[AsyncPost] result post failed: {e}")
+
+    if sos_event_payload:
+        try:
+            _post_sos_event_to_backend(dict(sos_event_payload))
+        except Exception as e:
+            print(f"[AsyncPost] SOS post failed: {e}")
+
+
 @app.get("/trips/<trip_id>/counters")
 def get_trip_counters_endpoint(trip_id: str) -> Any:
     """Get current event counters for a specific trip."""
@@ -1150,6 +1593,7 @@ def complete_trip_endpoint(trip_id: str) -> Any:
         get_driver_session_manager().reset_session(session_key=trip_id)
     except Exception:
         pass
+    _reset_episode_state(session_key=trip_id)
     
     return jsonify(summary), 200
 
@@ -1165,6 +1609,7 @@ def reset_trip_session_endpoint(trip_id: str) -> Any:
         get_driver_session_manager().reset_session(session_key=trip_id)
     except Exception:
         pass
+    _reset_episode_state(session_key=trip_id)
 
     # Also clear temporal state so detections don't carry over.
     try:
@@ -1308,6 +1753,7 @@ def register_driver() -> Any:
 
 @app.post("/analyze_frame")
 def analyze_frame() -> Any:
+    started_at = time.perf_counter()
     payload = request.get_json(silent=True) or {}
     trip_id = payload.get("trip_id")
 
@@ -1328,15 +1774,9 @@ def analyze_frame() -> Any:
               f"Yaw={yaw:.1f}° | Detections: {len(detection_result['detections'])}")
     
     sos_gesture = detection_result.get("sos_gesture", {})
-    trip_is_active = _is_trip_active(trip_id) if trip_id else False
-    sos_triggered = bool(sos_gesture.get("sos_triggered", False)) and bool(trip_is_active)
-    if not trip_is_active:
-        try:
-            sos_gesture = dict(sos_gesture)
-            sos_gesture["sos_triggered"] = False
-            detection_result["sos_gesture"] = sos_gesture
-        except Exception:
-            pass
+    # Keep fast loop independent from backend/network activity checks.
+    trip_is_active = bool(trip_id)
+    sos_triggered = bool(sos_gesture.get("sos_triggered", False))
 
     event_counters = risk_result.get("event_counters", {})
 
@@ -1367,40 +1807,44 @@ def analyze_frame() -> Any:
     driver_emotion_payload = {
         "driver_emotion": str(emo.get("dominant_emotion") or "unknown"),
         "confidence": float(emo.get("confidence") or 0.0),
+        "stress_level": str(emo.get("stress_level") or "LOW"),
+        "timestamp": emo.get("timestamp"),
     }
 
-    result_payload = {
-        "trip_id": trip_id,
-        "timestamp": ts,
-        "detections": detection_result["detections"],
-        "risk_score_temporal": risk_result.get("risk_score_temporal"),
-        "risk_level_temporal": risk_result.get("risk_level_temporal"),
-        "risk_score_weighted": risk_score_weighted,
-        "risk_level_weighted": risk_level_weighted,
-        "risk_score": recommended_score,  # Primary recommendation score
-        "risk_level": risk_level,  # Primary recommendation label
-        "reasons": risk_result["reasons"],
-        "event_counters": event_counters,
-        "sos_triggered": sos_triggered,
-        "sos_gesture": sos_gesture,
+    persist_metadata = {
+        "input_type": payload.get("input_type", "frame"),
+        "frame_id": payload.get("frame_id"),
+        "video_id": payload.get("video_id"),
+        "cv_metrics": detection_result.get("metrics", {}),
+        "driver": detection_result.get("driver"),
+        "passengers": detection_result.get("passengers", []),
+        "trip_active": trip_is_active,
         "driver_emotion": driver_emotion_payload,
-        "metadata": {
-            "input_type": payload.get("input_type", "frame"),
-            "frame_id": payload.get("frame_id"),
-            "video_id": payload.get("video_id"),
-            "cv_metrics": detection_result.get("metrics", {}),
-            "driver": detection_result.get("driver"),
-            "passengers": detection_result.get("passengers", []),
-            "trip_active": trip_is_active,
-            "driver_emotion": driver_emotion_payload,
-            "warnings": warnings,
-        },
+        "passenger_emotions": detection_result.get("passenger_emotions", []),
+        "warnings": warnings,
     }
+    active_driver_id = str((detection_result.get("personalization") or {}).get("driver_id") or _get_driver_id_from_trip(str(trip_id or "")))
+    session_key = str(trip_id or f"driver:{active_driver_id}")
+    episode_payloads = _build_episode_persistence_payloads(
+        session_key=session_key,
+        trip_id=str(trip_id or ""),
+        driver_id=active_driver_id,
+        detections=list(detection_result.get("detections", []) or []),
+        ts_iso=ts,
+        risk_result={
+            "risk_score_temporal": risk_result.get("risk_score_temporal"),
+            "risk_level_temporal": risk_result.get("risk_level_temporal"),
+            "risk_score_weighted": risk_score_weighted,
+            "risk_level_weighted": risk_level_weighted,
+            "risk_level": risk_level,
+            "reasons": risk_result.get("reasons", []),
+        },
+        driver_emotion_payload=driver_emotion_payload,
+        metadata=persist_metadata,
+    )
 
-    sent_to_backend, callback_message = _post_result_to_backend(result_payload)
-    
-    # Dedicated SOS feed (ONLY when trip is active).
-    if sos_triggered and trip_is_active:
+    sos_event_payload = None
+    if sos_triggered:
         sos_person = str(sos_gesture.get("person") or "driver")
         sos_source = (
             "ai_engine_passenger_hand_gesture"
@@ -1421,7 +1865,21 @@ def analyze_frame() -> Any:
                 "person": sos_person,
             },
         }
-        _post_sos_event_to_backend(sos_event_payload)
+
+    # Fire-and-forget backend persistence (never block request thread).
+    if episode_payloads or sos_event_payload:
+        threading.Thread(
+            target=_post_backend_async,
+            kwargs={
+                "result_payloads": episode_payloads,
+                "sos_event_payload": sos_event_payload,
+            },
+            daemon=True,
+            name=f"backend-post-{trip_id or 'unknown'}",
+        ).start()
+
+    fast_loop_ms = (time.perf_counter() - started_at) * 1000.0
+    print(f"[AnalyzeFrame] fast_loop_ms={fast_loop_ms:.1f} detections={len(detection_result['detections'])} trip_id={trip_id}")
 
     return jsonify({
         "trip_id": trip_id,
@@ -1442,12 +1900,14 @@ def analyze_frame() -> Any:
         "sos_triggered": sos_triggered,
         "sos_gesture": sos_gesture,
         "driver_emotion": driver_emotion_payload,
+        "passenger_emotions": detection_result.get("passenger_emotions", []),
         "emotion_result": emotion_result,
         "cv_metrics": detection_result.get("metrics", {}),
         "warnings": warnings,
+        "processing_ms": round(float(fast_loop_ms), 2),
         "backend_callback": {
-            "sent": sent_to_backend,
-            "message": callback_message,
+            "sent": None,
+            "message": "queued_async",
         },
     }), 200
 
@@ -1466,6 +1926,7 @@ def compute_risk() -> Any:
     result_payload = {
         "trip_id": trip_id,
         "timestamp": ts,
+        "source": "ai_engine",
         "detections": payload.get("detections", []),
         "risk_score_temporal": risk_result.get("risk_score_temporal"),
         "risk_level_temporal": risk_result.get("risk_level_temporal"),
@@ -1481,7 +1942,10 @@ def compute_risk() -> Any:
         },
     }
 
-    sent_to_backend, callback_message = _post_result_to_backend(result_payload)
+    if _compute_risk_persist_events:
+        sent_to_backend, callback_message = _post_result_to_backend(result_payload)
+    else:
+        sent_to_backend, callback_message = (False, "disabled_for_dedupe")
 
     return jsonify({
         "trip_id": trip_id,

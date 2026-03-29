@@ -1,0 +1,358 @@
+import React, { useState } from 'react';
+import { AlertCircle, Camera, Smartphone, Database, Monitor, Brain, MapPin, Bell, Radio } from 'lucide-react';
+
+const IVSArchitecture = () => {
+  const [selectedLayer, setSelectedLayer] = useState(null);
+  const [highlightSOS, setHighlightSOS] = useState(false);
+
+  const layers = {
+    dashboard: {
+      name: "Layer E: Web Dashboard",
+      subtitle: "Visualization / Observer Only",
+      color: "bg-purple-100 border-purple-400",
+      icon: Monitor,
+      responsibilities: [
+        "Live map with vehicle location",
+        "Route polyline visualization",
+        "Event timeline display",
+        "Risk status indicators",
+        "Emergency state display",
+        "Post-trip safety reports"
+      ],
+      doesNot: [
+        "Make decisions",
+        "Trigger SOS",
+        "Control system state"
+      ]
+    },
+    backend: {
+      name: "Layer D: Backend & Storage",
+      subtitle: "Flask + MongoDB / System Memory Hub",
+      color: "bg-blue-100 border-blue-400",
+      icon: Database,
+      responsibilities: [
+        "REST API endpoints",
+        "Trip lifecycle management",
+        "Persist GPS, events, risk history",
+        "Serve live state to dashboard",
+        "Aggregate data for reports"
+      ],
+      doesNot: [
+        "Make risk decisions",
+        "Compute risk scores",
+        "Trigger actions independently"
+      ]
+    },
+    ai: {
+      name: "Layer C: AI Decision & Risk Engine",
+      subtitle: "Core Brain / Reasoning",
+      color: "bg-green-100 border-green-400",
+      icon: Brain,
+      responsibilities: [
+        "Rule-based risk scoring",
+        "Multi-signal assessment",
+        "Driver warning generation",
+        "SOS suggestion logic",
+        "Emergency escalation",
+        "Temporal state management"
+      ],
+      doesNot: [
+        "Control vehicle",
+        "Act without SOS confirmation",
+        "Use emotions as primary trigger"
+      ]
+    },
+    ml: {
+      name: "Layer B: ML Monitoring",
+      subtitle: "Driver & Passenger / Perception",
+      color: "bg-yellow-100 border-yellow-400",
+      icon: Camera,
+      responsibilities: [
+        "Drowsiness detection (PERCLOS, yawning)",
+        "Distraction detection (head pose, gaze)",
+        "Passenger distress signals",
+        "SOS gesture detection (X-shape, 3-5s)",
+        "Emit signals with confidence scores"
+      ],
+      doesNot: [
+        "Make emergency decisions",
+        "Trigger actions alone",
+        "Decide risk severity"
+      ]
+    },
+    mobile: {
+      name: "Layer A: Mobile App",
+      subtitle: "Android / Lightweight IoT Device",
+      color: "bg-orange-100 border-orange-400",
+      icon: Smartphone,
+      responsibilities: [
+        "Start/End trip button",
+        "Foreground GPS tracking",
+        "Continuous location updates",
+        "Manual SOS trigger button"
+      ],
+      doesNot: [
+        "Run ML models",
+        "Compute risk scores",
+        "Make decisions"
+      ]
+    }
+  };
+
+  return (
+    <div className="w-full h-full bg-gradient-to-br from-gray-50 to-gray-100 p-6 overflow-auto">
+      <div className="max-w-7xl mx-auto">
+        {/* Header */}
+        <div className="text-center mb-8 bg-white rounded-lg shadow-lg p-6 border-4 border-indigo-600">
+          <h1 className="text-3xl font-bold text-indigo-900 mb-2">
+            Intelligent Vehicle Safety (IVS) System Architecture
+          </h1>
+          <p className="text-lg text-gray-600">
+            Sensing & Perception (ML) → Reasoning (AI) → Action → Storage → Visualization
+          </p>
+          <div className="flex justify-center gap-4 mt-4">
+            <button
+              onClick={() => setHighlightSOS(!highlightSOS)}
+              className={`px-4 py-2 rounded-lg font-semibold transition-all ${
+                highlightSOS 
+                  ? 'bg-red-600 text-white shadow-lg' 
+                  : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+              }`}
+            >
+              <AlertCircle className="inline mr-2" size={20} />
+              {highlightSOS ? 'Hide' : 'Show'} SOS Paths
+            </button>
+          </div>
+        </div>
+
+        {/* Architecture Layers */}
+        <div className="space-y-4 mb-8">
+          {Object.entries(layers).map(([key, layer]) => {
+            const Icon = layer.icon;
+            const isSelected = selectedLayer === key;
+            
+            return (
+              <div
+                key={key}
+                onClick={() => setSelectedLayer(isSelected ? null : key)}
+                className={`${layer.color} border-4 rounded-lg p-6 cursor-pointer transition-all transform hover:scale-102 hover:shadow-xl ${
+                  isSelected ? 'shadow-2xl scale-102' : 'shadow-md'
+                }`}
+              >
+                <div className="flex items-start gap-4">
+                  <div className={`p-3 rounded-full ${layer.color.replace('100', '200')}`}>
+                    <Icon size={32} className="text-gray-700" />
+                  </div>
+                  <div className="flex-1">
+                    <h2 className="text-xl font-bold text-gray-800">{layer.name}</h2>
+                    <p className="text-sm text-gray-600 mb-3">{layer.subtitle}</p>
+                    
+                    {isSelected && (
+                      <div className="grid md:grid-cols-2 gap-4 mt-4">
+                        <div className="bg-white rounded p-4 shadow">
+                          <h3 className="font-semibold text-green-700 mb-2 flex items-center">
+                            <span className="mr-2">✓</span> Responsibilities
+                          </h3>
+                          <ul className="text-sm space-y-1">
+                            {layer.responsibilities.map((item, i) => (
+                              <li key={i} className="text-gray-700">• {item}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div className="bg-white rounded p-4 shadow">
+                          <h3 className="font-semibold text-red-700 mb-2 flex items-center">
+                            <span className="mr-2">✗</span> Does NOT
+                          </h3>
+                          <ul className="text-sm space-y-1">
+                            {layer.doesNot.map((item, i) => (
+                              <li key={i} className="text-gray-700">• {item}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Data Flow Arrows */}
+        <div className="bg-white rounded-lg shadow-lg p-6 mb-8">
+          <h2 className="text-2xl font-bold text-gray-800 mb-4">Data Flow Pattern</h2>
+          <div className="flex items-center justify-center gap-4 flex-wrap">
+            <div className="text-center">
+              <div className="bg-orange-100 border-2 border-orange-400 rounded-lg p-4 mb-2">
+                <Smartphone size={32} className="mx-auto" />
+                <p className="text-sm font-semibold mt-2">Mobile App</p>
+              </div>
+              <p className="text-xs text-gray-600">GPS + SOS Button</p>
+            </div>
+            
+            <div className="text-3xl text-gray-400">→</div>
+            
+            <div className="text-center">
+              <div className="bg-yellow-100 border-2 border-yellow-400 rounded-lg p-4 mb-2">
+                <Camera size={32} className="mx-auto" />
+                <p className="text-sm font-semibold mt-2">ML Layer</p>
+              </div>
+              <p className="text-xs text-gray-600">Pattern Detection</p>
+            </div>
+            
+            <div className="text-3xl text-gray-400">→</div>
+            
+            <div className="text-center">
+              <div className="bg-green-100 border-2 border-green-400 rounded-lg p-4 mb-2">
+                <Brain size={32} className="mx-auto" />
+                <p className="text-sm font-semibold mt-2">AI Engine</p>
+              </div>
+              <p className="text-xs text-gray-600">Decision Making</p>
+            </div>
+            
+            <div className="text-3xl text-gray-400">→</div>
+            
+            <div className="text-center">
+              <div className="bg-blue-100 border-2 border-blue-400 rounded-lg p-4 mb-2">
+                <Database size={32} className="mx-auto" />
+                <p className="text-sm font-semibold mt-2">Backend</p>
+              </div>
+              <p className="text-xs text-gray-600">Storage + APIs</p>
+            </div>
+            
+            <div className="text-3xl text-gray-400">→</div>
+            
+            <div className="text-center">
+              <div className="bg-purple-100 border-2 border-purple-400 rounded-lg p-4 mb-2">
+                <Monitor size={32} className="mx-auto" />
+                <p className="text-sm font-semibold mt-2">Dashboard</p>
+              </div>
+              <p className="text-xs text-gray-600">Visualization</p>
+            </div>
+          </div>
+        </div>
+
+        {/* SOS Dual Path Visualization */}
+        {highlightSOS && (
+          <div className="bg-red-50 border-4 border-red-500 rounded-lg shadow-2xl p-6 mb-8 animate-pulse">
+            <h2 className="text-2xl font-bold text-red-800 mb-4 flex items-center">
+              <AlertCircle className="mr-2" size={28} />
+              Dual SOS Emergency Paths
+            </h2>
+            
+            <div className="grid md:grid-cols-2 gap-6">
+              {/* Path 1: ML Gesture */}
+              <div className="bg-white rounded-lg p-6 border-2 border-yellow-500">
+                <h3 className="text-lg font-bold text-yellow-700 mb-3 flex items-center">
+                  <Camera className="mr-2" size={24} />
+                  Path 1: ML Gesture SOS
+                </h3>
+                <ol className="space-y-2 text-sm">
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-yellow-700">1.</span>
+                    <span>Passenger performs X-shape gesture (hands above head)</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-yellow-700">2.</span>
+                    <span>ML detects sustained gesture (3-5 seconds)</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-yellow-700">3.</span>
+                    <span>ML emits SOS event (source=ML_GESTURE)</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-green-700">4.</span>
+                    <span>AI confirms and escalates</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-blue-700">5.</span>
+                    <span>Backend marks trip=EMERGENCY</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-red-700">6.</span>
+                    <span>Dashboard shows emergency + forces location sharing</span>
+                  </li>
+                </ol>
+              </div>
+
+              {/* Path 2: Mobile App */}
+              <div className="bg-white rounded-lg p-6 border-2 border-orange-500">
+                <h3 className="text-lg font-bold text-orange-700 mb-3 flex items-center">
+                  <Smartphone className="mr-2" size={24} />
+                  Path 2: Mobile App SOS
+                </h3>
+                <ol className="space-y-2 text-sm">
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-orange-700">1.</span>
+                    <span>Passenger presses SOS button in app</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-orange-700">2.</span>
+                    <span>App sends immediate SOS event</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-orange-700">3.</span>
+                    <span>Backend receives (source=MOBILE_APP)</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-blue-700">4.</span>
+                    <span>Backend marks trip=EMERGENCY</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-green-700">5.</span>
+                    <span>AI processes escalation logic</span>
+                  </li>
+                  <li className="flex items-start">
+                    <span className="font-bold mr-2 text-red-700">6.</span>
+                    <span>Dashboard shows emergency + forces location sharing</span>
+                  </li>
+                </ol>
+              </div>
+            </div>
+
+            <div className="mt-6 bg-red-100 border-2 border-red-600 rounded-lg p-4">
+              <p className="text-center font-bold text-red-800">
+                <Bell className="inline mr-2" size={20} />
+                Both paths → Same backend emergency logic → Same dashboard response
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Architectural Rules */}
+        <div className="bg-white rounded-lg shadow-lg p-6">
+          <h2 className="text-2xl font-bold text-gray-800 mb-4">Architectural Rules (Non-Negotiable)</h2>
+          <div className="grid md:grid-cols-2 gap-4">
+            {[
+              "ML never triggers irreversible actions alone",
+              "Mobile app never computes risk",
+              "Dashboard never controls system",
+              "AI logic lives in ONE place",
+              "Emotion detection is support only",
+              "SOS has dual trigger paths",
+              "Risk state is stateful & temporal",
+              "Every action is logged with source"
+            ].map((rule, i) => (
+              <div key={i} className="flex items-start bg-gray-50 rounded p-3">
+                <span className="font-bold text-indigo-600 mr-2">{i + 1}.</span>
+                <span className="text-gray-700">{rule}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Key Insight */}
+        <div className="mt-6 bg-gradient-to-r from-indigo-100 to-purple-100 border-4 border-indigo-500 rounded-lg p-6 text-center">
+          <p className="text-2xl font-bold text-indigo-900">
+            "ML detects PATTERNS. AI interprets MEANING."
+          </p>
+          <p className="text-gray-700 mt-2">
+            This separation is the foundation of the entire architecture
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default IVSArchitecture;

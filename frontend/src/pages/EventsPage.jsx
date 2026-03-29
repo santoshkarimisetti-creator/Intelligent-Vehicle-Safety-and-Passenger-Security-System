@@ -13,6 +13,7 @@ export default function EventsPage() {
   const [fromDate, setFromDate] = useState('')
   const [toDate, setToDate] = useState('')
   const [pageNum, setPageNum] = useState(1)
+  const [pageBlockStart, setPageBlockStart] = useState(1)
   const [totalCount, setTotalCount] = useState(0)
   const itemsPerPage = 10
 
@@ -125,6 +126,18 @@ export default function EventsPage() {
   }, [events])
 
   const totalPages = Math.max(1, Math.ceil((totalCount || 0) / itemsPerPage))
+  const pageWindowStart = Math.max(1, pageBlockStart)
+  const pageWindowEnd = Math.min(totalPages, pageWindowStart + 9)
+  const visiblePages = Array.from(
+    { length: Math.max(0, pageWindowEnd - pageWindowStart + 1) },
+    (_, i) => pageWindowStart + i,
+  )
+
+  useEffect(() => {
+    // Align number block only when current page changes.
+    const pageAlignedBlockStart = Math.floor((pageNum - 1) / 10) * 10 + 1
+    setPageBlockStart((prev) => (prev === pageAlignedBlockStart ? prev : pageAlignedBlockStart))
+  }, [pageNum])
   const riskLevels = ['SAFE', 'MODERATE', 'HIGH', 'CRITICAL']
 
   const formatTimestamp = (ts) => {
@@ -177,6 +190,7 @@ export default function EventsPage() {
           onChange={e => {
             setSelectedRiskLevel(e.target.value)
             setPageNum(1)
+            setPageBlockStart(1)
           }}
           className="filter-select"
         >
@@ -191,6 +205,7 @@ export default function EventsPage() {
           onChange={e => {
             setSelectedEventType(e.target.value)
             setPageNum(1)
+            setPageBlockStart(1)
           }}
           className="filter-select"
         >
@@ -205,6 +220,7 @@ export default function EventsPage() {
           onChange={e => {
             setDatePreset(e.target.value)
             setPageNum(1)
+            setPageBlockStart(1)
           }}
           className="filter-select"
         >
@@ -222,6 +238,7 @@ export default function EventsPage() {
               onChange={e => {
                 setFromDate(e.target.value)
                 setPageNum(1)
+                setPageBlockStart(1)
               }}
               className="filter-select"
             />
@@ -231,6 +248,7 @@ export default function EventsPage() {
               onChange={e => {
                 setToDate(e.target.value)
                 setPageNum(1)
+                setPageBlockStart(1)
               }}
               className="filter-select"
             />
@@ -247,6 +265,24 @@ export default function EventsPage() {
 
       {!loading && events.length > 0 && (
         <>
+          <div className="sticky-page-nav" role="navigation" aria-label="Events page navigation">
+            <button
+              onClick={() => setPageNum(Math.max(1, pageNum - 1))}
+              disabled={pageNum === 1}
+              className="pagination-btn"
+            >
+              Prev
+            </button>
+            <span className="page-info">Page {pageNum} / {totalPages}</span>
+            <button
+              onClick={() => setPageNum(Math.min(totalPages, pageNum + 1))}
+              disabled={pageNum >= totalPages}
+              className="pagination-btn"
+            >
+              Next
+            </button>
+          </div>
+
           <div className="events-list">
             {events.map(event => (
               <div key={event._id} className="event-card">
@@ -307,15 +343,14 @@ export default function EventsPage() {
 
           <div className="pagination">
             <button 
-              onClick={() => setPageNum(Math.max(1, pageNum - 1))}
-              disabled={pageNum === 1}
+              onClick={() => setPageBlockStart(Math.max(1, pageWindowStart - 10))}
+              disabled={pageWindowStart === 1}
               className="pagination-btn"
             >
-              Previous
+              {'<'}
             </button>
-            <span className="page-info">Page {pageNum} / {totalPages}</span>
 
-            {Array.from({ length: totalPages }, (_, i) => i + 1).map(p => (
+            {visiblePages.map(p => (
               <button
                 key={p}
                 onClick={() => setPageNum(p)}
@@ -326,11 +361,11 @@ export default function EventsPage() {
               </button>
             ))}
             <button 
-              onClick={() => setPageNum(pageNum + 1)}
-              disabled={pageNum >= totalPages}
+              onClick={() => setPageBlockStart(Math.min(totalPages, pageWindowStart + 10))}
+              disabled={pageWindowEnd >= totalPages}
               className="pagination-btn"
             >
-              Next
+              {'>'}
             </button>
           </div>
         </>

@@ -133,6 +133,19 @@ def _extract_detection_labels(detections):
     return uniq
 
 
+def _parse_event_ts(value):
+    if not value:
+        return datetime.utcnow()
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except Exception:
+        return datetime.utcnow()
+
+
+def _normalize_event_key(trip_id, driver_id, event_type, episode_start_ts):
+    return f"{trip_id}|{driver_id}|{event_type}|{episode_start_ts}"
+
+
 def haversine_distance(lat1, lon1, lat2, lon2):
     """Calculate distance in kilometers between two lat/lon points using Haversine formula."""
     R = 6371  # Earth's radius in km
@@ -190,6 +203,119 @@ def compute_trip_distance_km(path):
             total_distance += haversine_distance(prev_lat, prev_lon, curr_lat, curr_lon)
 
     return round(total_distance, 2)
+
+
+def _parse_datetime_any(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _safe_confidence(value) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return 0.0
+    return max(0.0, min(1.0, v))
+
+
+def compute_emotion_trip_summary(trip: dict, *, trip_end_time: datetime | None = None) -> dict:
+    negative_emotions = {"anger", "fear", "sadness", "disgust"}
+    ai_events = trip.get("ai_events", []) or []
+
+    points = []
+    for evt in ai_events:
+        de = evt.get("driver_emotion") or {}
+        if not isinstance(de, dict):
+            continue
+
+        emotion = str(de.get("driver_emotion") or de.get("emotion") or "").strip().lower()
+        if not emotion:
+            continue
+
+        ts = _parse_datetime_any(de.get("timestamp")) or _parse_datetime_any(evt.get("timestamp"))
+        if ts is None:
+            continue
+
+        confidence = _safe_confidence(de.get("confidence"))
+        points.append({"timestamp": ts, "emotion": emotion, "confidence": confidence})
+
+    points.sort(key=lambda x: x["timestamp"])
+
+    compressed = []
+    for p in points:
+        if (not compressed) or (compressed[-1]["emotion"] != p["emotion"]):
+            compressed.append(p)
+
+    start_dt = _parse_datetime_any(trip.get("start_time") or trip.get("start"))
+    end_dt = _parse_datetime_any(trip_end_time or trip.get("end_time") or trip.get("end"))
+    if start_dt is None and compressed:
+        start_dt = compressed[0]["timestamp"]
+    if end_dt is None:
+        end_dt = datetime.now(timezone.utc)
+    if start_dt is None:
+        start_dt = end_dt
+
+    total_seconds = max(1.0, (end_dt - start_dt).total_seconds())
+
+    durations = {}
+    if compressed:
+        timeline = [{"timestamp": start_dt, "emotion": compressed[0]["emotion"], "confidence": compressed[0]["confidence"]}] + compressed
+        if timeline[0]["timestamp"] > timeline[1]["timestamp"]:
+            timeline[0]["timestamp"] = timeline[1]["timestamp"]
+
+        for idx, current in enumerate(timeline):
+            t0 = current["timestamp"]
+            t1 = timeline[idx + 1]["timestamp"] if idx + 1 < len(timeline) else end_dt
+            if t1 < t0:
+                continue
+            sec = max(0.0, (t1 - t0).total_seconds())
+            emo = current["emotion"]
+            durations[emo] = durations.get(emo, 0.0) + sec
+
+    confidence_samples = [p["confidence"] for p in compressed]
+    avg_conf = (sum(confidence_samples) / len(confidence_samples)) if confidence_samples else 0.0
+
+    negative_seconds = sum(v for k, v in durations.items() if k in negative_emotions)
+    negative_ratio = max(0.0, min(1.0, negative_seconds / total_seconds))
+    stress_score = max(0.0, min(1.0, 0.7 * negative_ratio + 0.3 * avg_conf))
+
+    dominant_emotion = "unknown"
+    if durations:
+        dominant_emotion = max(durations.items(), key=lambda kv: kv[1])[0]
+
+    if stress_score >= 0.66:
+        stress_level = "HIGH"
+    elif stress_score >= 0.33:
+        stress_level = "MEDIUM"
+    else:
+        stress_level = "LOW"
+
+    duration_seconds_by_emotion = {k: round(v, 2) for k, v in durations.items()}
+    percentage_by_emotion = {
+        k: round((v / total_seconds) * 100.0, 2) for k, v in durations.items()
+    }
+
+    return {
+        "stress_level": stress_level,
+        "negative_ratio": round(negative_ratio, 4),
+        "stress_score": round(stress_score, 4),
+        "dominant_emotion": dominant_emotion,
+        "avg_confidence": round(avg_conf, 4),
+        "duration_seconds_by_emotion": duration_seconds_by_emotion,
+        "percentage_by_emotion": percentage_by_emotion,
+        "total_trip_seconds": round(total_seconds, 2),
+    }
 
 
 @app.get("/")
@@ -775,15 +901,78 @@ def add_ai_result(trip_id):
 
         payload = request.get_json(silent=True) or {}
 
+        source_raw = str(payload.get("source", "ai_engine")).strip().lower()
+        if "mobile" in source_raw:
+            source = "mobile_app"
+        elif "ai" in source_raw:
+            source = "ai_engine"
+        else:
+            source = source_raw or "ai_engine"
+
         detections = payload.get("detections", [])
         labels = _extract_detection_labels(detections)
+        event_action = str(payload.get("event_action") or "frame").strip().lower()
         event_type = payload.get("event_type")
         if not event_type or event_type in {"DETECTION", "AI Detection", "AI_DETECTION"}:
             # Store a stable primary label; the full list is in event_labels.
             event_type = labels[0] if labels else "DETECTION"
 
+        episode_id = str(payload.get("episode_id") or "").strip() or None
+        episode_start_ts = str(payload.get("episode_start_ts") or payload.get("timestamp") or datetime.utcnow().isoformat())
+        event_key = str(payload.get("event_key") or "").strip() or None
+        driver_id = str((payload.get("metadata") or {}).get("driver", {}).get("driver_id") or trip.get("driver_id") or "unknown_driver")
+        if not event_key and event_action == "start":
+            event_key = _normalize_event_key(trip_id, driver_id, event_type, episode_start_ts)
+
+        # Always keep trip-level risk summary fresh.
+        base_set = {
+            "risk_score": payload.get("risk_score"),
+            "risk_level": payload.get("risk_level", "UNKNOWN"),
+            "last_ai_update": datetime.utcnow(),
+        }
+
+        if event_action == "end":
+            query = {"trip_id": trip_id}
+            if episode_id:
+                query["ai_events.episode_id"] = episode_id
+            elif event_key:
+                query["ai_events.event_key"] = event_key
+            else:
+                return jsonify({"message": "episode end ignored: missing episode_id/event_key"}), 200
+
+            end_ts = str(payload.get("episode_end_ts") or payload.get("timestamp") or datetime.utcnow().isoformat())
+            duration_s = payload.get("duration_s")
+
+            update_doc = {
+                "$set": {
+                    **base_set,
+                    "ai_events.$.end_time": end_ts,
+                    "ai_events.$.duration_s": duration_s,
+                    "ai_events.$.status": "ended",
+                }
+            }
+            result = trips_collection.update_one(query, update_doc)
+            if result.modified_count > 0:
+                return jsonify({"message": "AI episode ended", "trip_id": trip_id, "event_type": event_type}), 200
+            return jsonify({"message": "AI episode end skipped (not found)", "trip_id": trip_id, "event_type": event_type}), 200
+
+        if event_action == "start" and event_key:
+            exists = trips_collection.find_one(
+                {"trip_id": trip_id, "ai_events.event_key": event_key},
+                {"_id": 1},
+            )
+            if exists:
+                trips_collection.update_one({"trip_id": trip_id}, {"$set": base_set})
+                return jsonify({"message": "Duplicate episode ignored", "trip_id": trip_id, "event_type": event_type}), 200
+
         event = {
             "timestamp": payload.get("timestamp") or datetime.utcnow().isoformat(),
+            "start_time": episode_start_ts if event_action == "start" else None,
+            "end_time": None,
+            "status": "active" if event_action == "start" else "frame",
+            "event_action": event_action,
+            "event_key": event_key,
+            "episode_id": episode_id,
             "event_type": event_type,
             "event_labels": labels,
             "detections": detections,
@@ -795,15 +984,16 @@ def add_ai_result(trip_id):
             "risk_level_weighted": payload.get("risk_level_weighted"),
             "reasons": payload.get("reasons", []),
             "sos_triggered": bool(payload.get("sos_triggered", False)),
+            "sos_source": payload.get("sos_source"),
+            "driver_emotion": payload.get("driver_emotion"),
+            "passenger_emotions": payload.get("passenger_emotions", []),
             "metadata": payload.get("metadata", {}),
-            "source": "ai_engine",
+            "source": source,
         }
 
         update_doc = {
             "$set": {
-                "risk_score": payload.get("risk_score"),
-                "risk_level": payload.get("risk_level", "UNKNOWN"),
-                "last_ai_update": datetime.utcnow(),
+                **base_set,
             },
             "$push": {
                 "ai_events": event
@@ -816,7 +1006,8 @@ def add_ai_result(trip_id):
             "message": "AI result recorded",
             "trip_id": trip_id,
             "risk_level": payload.get("risk_level", "UNKNOWN"),
-            "risk_score": payload.get("risk_score")
+            "risk_score": payload.get("risk_score"),
+            "source": source,
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1049,6 +1240,7 @@ def end_trip(trip_id):
         distance_km = compute_trip_distance_km(path)
         max_speed = compute_max_speed(trip)
         end_time = datetime.utcnow()
+        emotion_summary = compute_emotion_trip_summary(trip, trip_end_time=end_time)
         
         # Calculate trip duration
         start_time = trip.get("start_time")
@@ -1072,7 +1264,8 @@ def end_trip(trip_id):
                     "end_time": end_time,
                     "distance_km": distance_km,
                     "max_speed": max_speed,
-                    "duration_minutes": duration_minutes
+                    "duration_minutes": duration_minutes,
+                    "emotion_summary": emotion_summary,
                 }
             }
         )
@@ -1090,6 +1283,7 @@ def end_trip(trip_id):
             "distance_km": distance_km,
             "max_speed": max_speed,
             "duration_minutes": duration_minutes,
+            "emotion_summary": emotion_summary,
             "end_time": to_ist_display(end_time)
         }), 200
     except Exception as e:
@@ -1267,6 +1461,9 @@ def add_event():
         
         detections = payload.get("detections", {})
         labels = _extract_detection_labels(detections)
+        event_action = str(payload.get("event_action") or "frame").strip().lower()
+        episode_id = str(payload.get("episode_id") or "").strip() or None
+        event_key = str(payload.get("event_key") or "").strip() or None
         incoming_type_raw = (payload.get("event_type") or "").strip()
         is_sos = bool(payload.get("is_sos", False))
         is_generic_type = (not incoming_type_raw) or (incoming_type_raw in {"DETECTION", "AI Detection", "AI_DETECTION"})
@@ -1280,8 +1477,9 @@ def add_event():
             risk_w_f = 0.0
         meaningful_risk = risk_lvl in {"MODERATE", "HIGH", "CRITICAL"} or risk_w_f >= 21.0
 
-        # Reject empty frames: no labels, no SOS, generic type, and no meaningful risk
-        if (not labels) and (not is_sos) and is_generic_type and (not meaningful_risk):
+        # Reject generic empty frames regardless of risk-level bucket to avoid
+        # filling DB with synthetic DETECTION rows that have no actual detections.
+        if (not labels) and (not is_sos) and is_generic_type:
             return jsonify({"message": "No detections; event skipped"}), 200
         
         # Additional strict check: if completely empty and not SOS/high-risk, skip it
@@ -1294,10 +1492,55 @@ def add_event():
             # Prefer a stable primary label; keep full list in event_labels.
             incoming_type = labels[0] if labels else "DETECTION"
 
+        source_raw = str(payload.get("source") or payload.get("sos_source") or "ai_engine").strip().lower()
+        if "mobile" in source_raw:
+            source = "mobile_app"
+        elif "ai" in source_raw:
+            source = "ai_engine"
+        else:
+            source = source_raw or "ai_engine"
+
+        if event_action == "end":
+            end_ts = payload.get("episode_end_ts") or payload.get("timestamp") or datetime.utcnow().isoformat()
+            duration_s = payload.get("duration_s")
+            query = {}
+            if episode_id:
+                query["episode_id"] = episode_id
+            elif event_key:
+                query["event_key"] = event_key
+            else:
+                return jsonify({"message": "episode end ignored: missing episode_id/event_key"}), 200
+
+            result = events_collection.update_one(
+                query,
+                {
+                    "$set": {
+                        "end_time": end_ts,
+                        "duration_s": duration_s,
+                        "status": "ended",
+                        "received_at": datetime.utcnow(),
+                    }
+                },
+            )
+            if result.modified_count > 0:
+                return jsonify({"message": "Event episode ended"}), 200
+            return jsonify({"message": "Episode end skipped (not found)"}), 200
+
+        if event_action == "start" and event_key:
+            exists = events_collection.find_one({"event_key": event_key}, {"_id": 1})
+            if exists:
+                return jsonify({"message": "Duplicate episode ignored"}), 200
+
         event = {
             "event_id": str(uuid.uuid4()),
             "trip_id": payload.get("trip_id"),
             "timestamp": payload.get("timestamp") or datetime.utcnow().isoformat(),
+            "start_time": payload.get("episode_start_ts") or payload.get("timestamp") or datetime.utcnow().isoformat(),
+            "end_time": None,
+            "status": "active" if event_action == "start" else "frame",
+            "event_action": event_action,
+            "episode_id": episode_id,
+            "event_key": event_key,
             "event_type": incoming_type,
             "event_labels": labels,
             "detections": detections,
@@ -1306,6 +1549,10 @@ def add_event():
             "risk_level": payload.get("risk_level"),
             "reasons": payload.get("reasons", []),
             "is_sos": is_sos,
+            "sos_source": payload.get("sos_source"),
+            "driver_emotion": payload.get("driver_emotion"),
+            "passenger_emotions": payload.get("passenger_emotions", []),
+            "source": source,
             "metadata": payload.get("metadata", {}),
             "received_at": datetime.utcnow()
         }
@@ -1315,7 +1562,8 @@ def add_event():
         return jsonify({
             "message": "Event recorded",
             "event_id": event["event_id"],
-            "risk_level": event.get("risk_level")
+            "risk_level": event.get("risk_level"),
+            "source": source,
         }), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500

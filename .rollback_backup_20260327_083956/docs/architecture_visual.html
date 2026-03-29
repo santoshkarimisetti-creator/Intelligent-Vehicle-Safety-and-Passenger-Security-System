@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IVS Architecture - One Glance</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            overflow: hidden;
+            height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .diagram-container {
+            width: 95vw;
+            height: 95vh;
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 25px 80px rgba(0,0,0,0.4);
+            display: grid;
+            grid-template-rows: auto 1fr auto;
+            gap: 20px;
+        }
+
+        .header {
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2em;
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+
+        .header .tagline {
+            font-size: 1.1em;
+            color: #e74c3c;
+            font-weight: 600;
+            letter-spacing: 1px;
+        }
+
+        .main-diagram {
+            display: grid;
+            grid-template-columns: 200px 1fr 200px;
+            gap: 20px;
+            height: 100%;
+        }
+
+        /* Left side - Mobile */
+        .mobile-section {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .box {
+            border-radius: 10px;
+            padding: 15px;
+            text-align: center;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+
+        .box-title {
+            font-weight: bold;
+            font-size: 0.9em;
+            margin-bottom: 8px;
+        }
+
+        .box-content {
+            font-size: 0.75em;
+            line-height: 1.4;
+        }
+
+        .mobile-box {
+            background: linear-gradient(135deg, #3498db, #5dade2);
+            color: white;
+            height: 50%;
+        }
+
+        .camera-box {
+            background: linear-gradient(135deg, #2ecc71, #58d68d);
+            color: white;
+            height: 50%;
+        }
+
+        /* Center column - Main flow */
+        .center-flow {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .layer-box {
+            border-radius: 12px;
+            padding: 12px 20px;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.15);
+            display: grid;
+            grid-template-columns: 60px 1fr 1fr;
+            gap: 15px;
+            align-items: center;
+            transition: transform 0.2s;
+        }
+
+        .layer-box:hover {
+            transform: scale(1.02);
+        }
+
+        .layer-number {
+            font-size: 2em;
+            font-weight: bold;
+            color: white;
+            background: rgba(0,0,0,0.2);
+            width: 50px;
+            height: 50px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .layer-info {
+            font-size: 0.8em;
+        }
+
+        .layer-name {
+            font-weight: bold;
+            font-size: 1.1em;
+            margin-bottom: 5px;
+        }
+
+        .layer-role {
+            opacity: 0.9;
+            font-size: 0.85em;
+        }
+
+        .layer-details {
+            font-size: 0.75em;
+            line-height: 1.5;
+        }
+
+        .layer-e {
+            background: linear-gradient(135deg, #9b59b6, #af7ac5);
+            color: white;
+        }
+
+        .layer-d {
+            background: linear-gradient(135deg, #e74c3c, #ec7063);
+            color: white;
+        }
+
+        .layer-c {
+            background: linear-gradient(135deg, #f39c12, #f5b041);
+            color: white;
+        }
+
+        .layer-b {
+            background: linear-gradient(135deg, #2ecc71, #58d68d);
+            color: white;
+        }
+
+        .arrow-between {
+            text-align: center;
+            font-size: 1.5em;
+            color: #7f8c8d;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        /* Right side - SOS paths */
+        .sos-section {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+
+        .sos-title {
+            background: #e74c3c;
+            color: white;
+            padding: 10px;
+            border-radius: 10px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+
+        .sos-path {
+            background: linear-gradient(135deg, #ffebee, #ffcdd2);
+            border: 2px solid #e74c3c;
+            border-radius: 10px;
+            padding: 12px;
+            flex: 1;
+        }
+
+        .sos-path-title {
+            font-weight: bold;
+            color: #c0392b;
+            margin-bottom: 8px;
+            font-size: 0.85em;
+        }
+
+        .sos-steps {
+            font-size: 0.7em;
+            line-height: 1.6;
+            color: #333;
+        }
+
+        .sos-convergence {
+            background: #e74c3c;
+            color: white;
+            padding: 12px;
+            border-radius: 10px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 0.8em;
+        }
+
+        /* Footer rules */
+        .footer-rules {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 10px;
+        }
+
+        .rule {
+            background: #ecf0f1;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border-left: 4px solid #34495e;
+            font-size: 0.7em;
+            line-height: 1.4;
+        }
+
+        .rule strong {
+            display: block;
+            color: #2c3e50;
+            margin-bottom: 3px;
+        }
+
+        .key-principle {
+            grid-column: span 4;
+            background: linear-gradient(90deg, #f39c12, #e74c3c);
+            color: white;
+            padding: 10px;
+            border-radius: 8px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+
+        /* Arrows connecting boxes */
+        .connector {
+            position: relative;
+        }
+
+        .connector::after {
+            content: '→';
+            position: absolute;
+            font-size: 2em;
+            color: #7f8c8d;
+        }
+
+        @media print {
+            body {
+                background: white;
+            }
+            .diagram-container {
+                box-shadow: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="diagram-container">
+        <!-- Header -->
+        <div class="header">
+            <h1>System Architecture</h1>
+            <div class="tagline">Sensing (ML) → Reasoning (AI) → Action → Storage → Visualization</div>
+        </div>
+
+        <!-- Main Diagram -->
+        <div class="main-diagram">
+            <!-- Left Column: Input Sources -->
+            <div class="mobile-section">
+                <div class="box mobile-box">
+                    <div class="box-title">📱 MOBILE APP<br>(Layer A)</div>
+                    <div class="box-content">
+                        • GPS tracking<br>
+                        • Start/End trip<br>
+                        • SOS button<br>
+                        <strong style="margin-top:8px;display:block;">→ Location + Manual SOS</strong>
+                    </div>
+                </div>
+                <div class="box camera-box">
+                    <div class="box-title">📹 CAMERA<br>(Input)</div>
+                    <div class="box-content">
+                        • Driver-facing camera<br>
+                        • Passenger-facing / cabin camera<br>
+                        • Video stream to ML layer<br>
+                        <strong style="margin-top:8px;display:block;">→ Real-time processing</strong>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Center Column: Layer Stack -->
+            <div class="center-flow">
+                <!-- Layer E: Dashboard -->
+                <div class="layer-box layer-e">
+                    <div class="layer-number">E</div>
+                    <div class="layer-info">
+                        <div class="layer-name">Dashboard</div>
+                        <div class="layer-role">Visualization</div>
+                    </div>
+                    <div class="layer-details">
+                        ✓ Live map & route<br>
+                        ✓ Event timeline<br>
+                        ✗ No decisions
+                    </div>
+                </div>
+
+                <div class="arrow-between">⬆️</div>
+
+                <!-- Layer D: Backend -->
+                <div class="layer-box layer-d">
+                    <div class="layer-number">D</div>
+                    <div class="layer-info">
+                        <div class="layer-name">Backend</div>
+                        <div class="layer-role">Storage</div>
+                    </div>
+                    <div class="layer-details">
+                        ✓ REST APIs<br>
+                        ✓ Store events/GPS<br>
+                        ✓ API + Engine Module
+                    </div>
+                </div>
+
+                <div class="arrow-between">⬆️</div>
+
+                <!-- Layer C: AI Engine -->
+                <div class="layer-box layer-c">
+                    <div class="layer-number">C</div>
+                    <div class="layer-info">
+                        <div class="layer-name">AI Engine</div>
+                        <div class="layer-role">Reasoning</div>
+                    </div>
+                    <div class="layer-details">
+                        ✓ Risk scoring<br>
+                        ✓ Decision logic<br>
+                        ✓ Emergency escalation logic
+                    </div>
+                </div>
+
+                <div class="arrow-between">⬆️</div>
+
+                <!-- Layer B: ML Monitoring -->
+                <div class="layer-box layer-b">
+                    <div class="layer-number">B</div>
+                    <div class="layer-info">
+                        <div class="layer-name">ML Monitoring</div>
+                        <div class="layer-role">Perception</div>
+                    </div>
+                    <div class="layer-details">
+                        ✓ Drowsiness detect<br>
+                        ✓ Distraction detect<br>
+                        ✗ No decisions
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: SOS Paths -->
+            <div class="sos-section">
+                <div class="sos-title">🚨 DUAL SOS PATHS</div>
+                
+                <div class="sos-path">
+                    <div class="sos-path-title">Path 1: ML Gesture</div>
+                    <div class="sos-steps">
+                        1. X-shape gesture detected<br>
+                        2. ML emits SOS intent<br>
+                        3. Backend marks trip → EMERGENCY<br>
+                        4. AI processes logic
+                    </div>
+                </div>
+
+                <div class="sos-path">
+                    <div class="sos-path-title">Path 2: Mobile Button</div>
+                    <div class="sos-steps">
+                        1. User presses SOS<br>
+                        2. App sends event<br>
+                        3. Backend marks trip → EMERGENCY<br>
+                        4. AI processes logic
+                    </div>
+                </div>
+
+                <div class="sos-convergence">
+                    Both → Same Emergency Logic
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer: Rules -->
+        <div class="footer-rules">
+            <div class="key-principle">
+                💡 ML detects PATTERNS → AI interprets MEANING → Backend stores → Dashboard shows
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 1:</strong>
+                ML never triggers actions alone
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 2:</strong>
+                Mobile never computes risk
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 3:</strong>
+                Dashboard never controls
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 4:</strong>
+                AI logic in ONE place
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 5:</strong>
+                Emotion = support only
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 6:</strong>
+                SOS = dual paths
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 7:</strong>
+                Risk = temporal state
+            </div>
+            
+            <div class="rule">
+                <strong>Rule 8:</strong>
+                Full traceability
+            </div>
+        </div>
+    </div>
+
+    <script>
+        console.log('%c🚗 IVS Architecture - One Glance View', 'color: #2ecc71; font-size: 16px; font-weight: bold;');
+        console.log('%cPress Ctrl+P to print', 'color: #3498db; font-size: 12px;');
+        
+        // Print handler
+        document.addEventListener('keydown', function(e) {
+            if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
+                window.print();
+            }
+        });
+    </script>
+</body>
+</html>

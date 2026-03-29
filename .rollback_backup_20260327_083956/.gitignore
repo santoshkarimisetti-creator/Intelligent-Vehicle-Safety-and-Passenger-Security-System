@@ -1,0 +1,136 @@
+# ===== Python / Backend / AI Engine =====
+backend/.venv/
+backend/__pycache__/
+backend/*.log
+backend/server.log
+ai_engine/.venv/
+ai_engine/__pycache__/
+ai_engine/*.log
+ai_engine/*.task
+ai_engine/face_landmarker.task
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ===== Android =====
+android/**/build/
+android/**/.gradle/
+android/**/local.properties
+android/**/captures/
+*.apk
+*.aab
+
+# ===== Frontend =====
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+frontend/.vite/
+frontend/coverage/
+frontend/.env
+frontend/.env.*
+frontend/*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+vite.config.*.timestamp-*
+
+# ===== Database / Environment =====
+.env
+.env.local
+.env.*.local
+
+# ===== IDE / OS =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ===== Project Specific =====
+.cache/
+*.cache
+temp/
+tmp/
+logs/
+*.log
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# ===== Temporary Scripts for Database Maintenance =====
+backend/migrate_trips.py
+backend/check_sos_trips.py
+backend/add_ai_sos_trip.py
+backend/insert_test_sos_data.py
+
+# ===== New AI / Model Artifacts (Do NOT Commit) =====
+# DeepFace / face recognition / mediapipe downloaded models
+ai_engine/models/
+ai_engine/*.onnx
+ai_engine/*.h5
+ai_engine/*.pb
+ai_engine/*.tflite
+ai_engine/*.pth
+ai_engine/*.pt
+ai_engine/driver_embeddings.json
+
+# Local ML caches
+.deepface/
+.cache/torch/
+.cache/huggingface/
+
+# Generated report/map outputs and local test payloads
+backend/reports/
+backend/*.pdf
+backend/*_map.png
+payload.json
+
+# ===== Database Data (Should NOT be pushed) =====
+mongodb/
+data/
+*.db
+*.sqlite
+*.sqlite3
+mongo_data/
+db_data/
+
+# ===== OS Files =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+desktop.ini

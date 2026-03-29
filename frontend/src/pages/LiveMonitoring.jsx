@@ -10,12 +10,19 @@ export default function LiveMonitoring(){
   const audioContextRef = useRef(null)
   const lastBeepAtRef = useRef(0)
   const lastBeepByTypeRef = useRef(new Map())
+  const activeDetectionStateRef = useRef({
+    drowsiness: false,
+    yawning: false,
+    distraction: false,
+    driver_not_visible: false,
+  })
+  const lastGlobalSoundRef = useRef({ at: 0, type: null })
   const lastEmotionRef = useRef(null)
   const emotionCandidateRef = useRef(null)
   const lastEmotionAlertAtRef = useRef(0)
   const [speed, setSpeed] = useState(45)
   const [state, setState] = useState('ACTIVE')
-  const [risk, setRisk] = useState(12)
+  const [risk, setRisk] = useState(0)
   const [driverStatus, setDriverStatus] = useState('ALERT')
   const [sos, setSos] = useState(false)
   const [position, setPosition] = useState(null)
@@ -26,7 +33,7 @@ export default function LiveMonitoring(){
   const [cvMetrics, setCvMetrics] = useState(null)
   const [smoothedBBox, setSmoothedBBox] = useState(null)
   const [analysisError, setAnalysisError] = useState(null)
-  const [driverEmotion, setDriverEmotion] = useState({ driver_emotion: 'unknown', confidence: 0 })
+  const [driverEmotion, setDriverEmotion] = useState({ driver_emotion: 'unknown', confidence: 0, stress_level: 'LOW' })
 
   const initAudio = async () => {
     try {
@@ -63,9 +70,9 @@ export default function LiveMonitoring(){
 
       // 3-second alert: ramp up, sustain, ramp down
       gain.gain.setValueAtTime(0.0001, ctx.currentTime)
-      gain.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.05)  // attack: 50ms
-      gain.gain.setValueAtTime(0.15, ctx.currentTime + 2.95)  // sustain at 0.15 for ~2.9s
-      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 3.00)  // release: 50ms
+      gain.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.05)
+      gain.gain.setValueAtTime(0.15, ctx.currentTime + 2.95)
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 3.00)
 
       osc.connect(gain)
       gain.connect(ctx.destination)
@@ -83,6 +90,25 @@ export default function LiveMonitoring(){
       const last = Number(lastBeepByTypeRef.current.get(key) || 0)
       if (now - last < cooldownMs) return
       lastBeepByTypeRef.current.set(key, now)
+      playBeep(level)
+    } catch {
+      // ignore
+    }
+  }
+
+  const maybePlayTransitionAlert = (eventType, level = 'HIGH') => {
+    try {
+      const now = Date.now()
+      const globalCooldownMs = 4000
+      const lastGlobal = lastGlobalSoundRef.current
+      if (
+        (now - Number(lastGlobal.at || 0) < globalCooldownMs)
+        && String(lastGlobal.type || '') === String(eventType || '')
+      ) {
+        return
+      }
+
+      lastGlobalSoundRef.current = { at: now, type: eventType }
       playBeep(level)
     } catch {
       // ignore
@@ -132,17 +158,10 @@ export default function LiveMonitoring(){
     // Check AI engine health
     checkAIEngineHealth().then(setAIEngineStatus)
 
-    // subscribe to live telemetry (mock) so you can see speed/map without backend
+    // subscribe to live telemetry only for synthetic speed while backend sensors are unavailable
     const unsub = subscribeLive(data =>{
       setSpeed(data.speed)
-      setRisk(data.risk)
       setState(data.state)
-      setDriverStatus(data.driverStatus)
-      if(data.lat && data.lon){
-        setPosition([data.lat, data.lon])
-        // Set a dummy trip ID for demo (in real app, use actual trip ID)
-        if(!tripId) setTripId('active-trip')
-      }
     })
 
     return ()=> {
@@ -150,15 +169,43 @@ export default function LiveMonitoring(){
       window.removeEventListener('keydown', unlockAudio)
       unsub()
     }
-  },[tripId])
+  },[])
+
+  // Source map + active trip state from backend (no random mock coordinates).
+  useEffect(() => {
+    const fetchLiveMap = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/trips/active-trip/live_map`)
+        if (!res.ok) return
+        const data = await res.json()
+        const active = Boolean(data.trip_active)
+        setState(active ? 'ACTIVE' : 'IDLE')
+        setTripId(active ? (data.trip_id || null) : null)
+
+        const loc = data.current_location
+        if (loc && Number.isFinite(Number(loc.lat)) && Number.isFinite(Number(loc.lng))) {
+          setPosition([Number(loc.lat), Number(loc.lng)])
+        } else {
+          setPosition(null)
+        }
+      } catch (e) {
+        console.warn('Failed to fetch live map data', e)
+      }
+    }
+
+    fetchLiveMap()
+    const interval = setInterval(fetchLiveMap, 5000)
+    return () => clearInterval(interval)
+  }, [])
 
   // Fetch live distance from backend
   useEffect(()=>{
-    if(!tripId) return
-    
     const fetchDistance = async () => {
       try {
-        const res = await fetch(`${API_BASE}/trips/${encodeURIComponent(tripId)}/distance`)
+        const endpoint = tripId
+          ? `${API_BASE}/trips/${encodeURIComponent(tripId)}/distance`
+          : `${API_BASE}/trips/active-trip/distance`
+        const res = await fetch(endpoint)
         if(res.ok){
           const data = await res.json()
           setDistanceKm(data.distance_km || 0)
@@ -175,7 +222,7 @@ export default function LiveMonitoring(){
 
   // AI Engine Integration: Send frames for analysis
   useEffect(() => {
-    if (!aiEngineStatus || !tripId || !videoRef.current) return
+    if (!aiEngineStatus || !videoRef.current) return
 
     let inFlight = false
 
@@ -197,45 +244,59 @@ export default function LiveMonitoring(){
         const emo = result.driver_emotion || result.emotion_result || {}
         const emoLabel = String(emo.driver_emotion || emo.dominant_emotion || 'unknown')
         const emoConf = Number(emo.confidence || 0)
-        setDriverEmotion({ driver_emotion: emoLabel, confidence: emoConf })
+        setDriverEmotion({
+          driver_emotion: emoLabel,
+          confidence: emoConf,
+          stress_level: String(emo.stress_level || 'LOW'),
+        })
 
-        // Trigger audio warnings on risk escalation (HIGH/CRITICAL) with cooldown.
-        if (Array.isArray(result.warnings) && result.warnings.length > 0) {
-          const hasCritical = result.warnings.some(w => w.severity === 'CRITICAL')
-          const hasHigh = result.warnings.some(w => w.severity === 'HIGH')
-          if (hasCritical) playBeep('CRITICAL')
-          else if (hasHigh) playBeep('HIGH')
-        }
-        
         // Update UI with AI results
         if (result.risk_score_weighted !== undefined) {
           setRisk(result.risk_score_weighted)
         }
 
-        // Update detections
-        if (result.detections && result.detections.length > 0) {
-          setDetections(result.detections)
+        // Always process detections as current-frame only.
+        const frameDetections = Array.isArray(result.detections) ? result.detections : []
+        setDetections([])
+        setDetections(frameDetections)
 
-          // Instant sound for *any* detection type (with per-type cooldown).
-          for (const d of result.detections) {
-            const t = d?.type ? String(d.type) : 'detection'
-            const sev = (t === 'sos_gesture' || t === 'SOS') ? 'CRITICAL' : 'HIGH'
-            playDetectionBeep(`det:${t}`, sev, sev === 'CRITICAL' ? 3000 : 6000)
-          }
-          
-          // Update driver status based on detections
-          const hasDrowsiness = result.detections.some(d => d.type === 'drowsiness')
-          const hasDistraction = result.detections.some(d => d.type === 'distraction')
-          
-          if (hasDrowsiness) {
-            setDriverStatus('DROWSY')
-          } else if (hasDistraction) {
-            setDriverStatus('DISTRACTED')
-          } else {
-            setDriverStatus('ALERT')
-          }
+        const hasByType = {
+          drowsiness: frameDetections.some(d => d?.type === 'drowsiness'),
+          yawning: frameDetections.some(d => d?.type === 'yawning'),
+          distraction: frameDetections.some(d => d?.type === 'distraction'),
+          driver_not_visible: frameDetections.some(d => d?.type === 'driver_not_visible'),
+        }
+
+        // Trigger sound only on inactive -> active transitions.
+        const prevDetectionState = activeDetectionStateRef.current
+        if (!prevDetectionState.drowsiness && hasByType.drowsiness) {
+          maybePlayTransitionAlert('drowsiness', 'HIGH')
+        }
+        if (!prevDetectionState.yawning && hasByType.yawning) {
+          maybePlayTransitionAlert('yawning', 'HIGH')
+        }
+        if (!prevDetectionState.distraction && hasByType.distraction) {
+          maybePlayTransitionAlert('distraction', 'HIGH')
+        } else if (!prevDetectionState.driver_not_visible && hasByType.driver_not_visible) {
+          maybePlayTransitionAlert('driver_not_visible', 'CRITICAL')
+        }
+
+        // Reset event state immediately when detection ends.
+        activeDetectionStateRef.current = {
+          drowsiness: hasByType.drowsiness,
+          yawning: hasByType.yawning,
+          distraction: hasByType.distraction,
+          driver_not_visible: hasByType.driver_not_visible,
+        }
+
+        // Update driver status based only on current-frame detections.
+        if (hasByType.drowsiness) {
+          setDriverStatus('DROWSY')
+        } else if (hasByType.distraction) {
+          setDriverStatus('DISTRACTED')
+        } else if (hasByType.driver_not_visible) {
+          setDriverStatus('NOT_VISIBLE')
         } else {
-          setDetections([])
           setDriverStatus('ALERT')
         }
 
@@ -404,6 +465,13 @@ export default function LiveMonitoring(){
             <div className="value">
               <span className="badge blue">
                 {driverEmotion.driver_emotion} ({Math.round((driverEmotion.confidence || 0) * 100)}%)
+              </span>
+            </div>
+          </div>
+          <div className="stat"><strong>Stress Level</strong>
+            <div className="value">
+              <span className={`badge ${driverEmotion.stress_level === 'HIGH' ? 'red' : driverEmotion.stress_level === 'MEDIUM' ? 'orange' : 'green'}`}>
+                {driverEmotion.stress_level || 'LOW'}
               </span>
             </div>
           </div>

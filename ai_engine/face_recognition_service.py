@@ -102,11 +102,7 @@ class FaceRecognitionService:
         self._recognizer: Optional[Any] = None
 
         self._mongo_uri = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
-        db_env = os.getenv("DB_NAME")
-        if db_env and str(db_env).upper() == "IVSPS":
-            self._mongo_db = "IVSPS"
-        else:
-            self._mongo_db = os.getenv("MONGO_DB", "IVS")
+        self._mongo_db = os.getenv("MONGO_DB", "ivs_db")
         self._mongo_drivers_collection = os.getenv("MONGO_DRIVERS_COLLECTION", "drivers")
         self._mongo_connect_timeout_ms = int(os.getenv("MONGO_CONNECT_TIMEOUT_MS", "1500"))
         self._embeddings_cache_ttl_s = float(os.getenv("DRIVER_EMBEDDINGS_CACHE_TTL", "30"))
