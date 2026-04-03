@@ -130,6 +130,7 @@ class RiskEngine:
 
         # Increment event counters once per frame per event type
         types = {str(d.get("type", "")) for d in (detections or [])}
+        driver_not_visible = "driver_not_visible" in types
         if "drowsiness" in types:
             counters.drowsiness_events += 1
         if "yawning" in types or "fatigue_yawn" in types:
@@ -183,6 +184,8 @@ class RiskEngine:
         temporal_score = _clamp(float(base_score), 0.0, 100.0)
 
         reasons: List[str] = []
+        if driver_not_visible:
+            reasons.append("driver_not_visible")
         if eyes_closed_score >= 0.6:
             reasons.append("high_eye_closure")
         if head_off_road_score >= 0.5:
@@ -205,6 +208,15 @@ class RiskEngine:
             head_off_road_score=head_off_road_score,
             yawning_score=yawning_score,
         )
+
+        # Policy override: driver face not visible should always be treated as HIGH risk.
+        # The UI/backend expects `risk_level` to align with the weighted score, so we apply
+        # a score floor rather than only overriding the label.
+        if driver_not_visible:
+            temporal_score = max(float(temporal_score), 60.0)
+            weighted_score = max(float(weighted.get("risk_score_weighted") or 0.0), 51.0)
+            weighted["risk_score_weighted"] = round(weighted_score, 2)
+            weighted["risk_level_weighted"] = _risk_level_weighted(weighted_score)
 
         fatigue_score = _clamp(
             (

@@ -61,14 +61,7 @@ NO_ACTIVE_TRIP_ID = os.getenv("NO_ACTIVE_TRIP_ID", "NO_ACTIVE_TRIP")
 
 # Face metrics are produced by MediaPipe FaceMesh in landmark_engine.py
 
-# SOS gesture tracking
-sos_gesture_state = {
-    "is_palm_open": False,
-    "palm_start_time": None,
-    "trip_id": None
-}
-
-# Passenger SOS gesture state (open palm held for longer).
+# Passenger SOS gesture state.
 passenger_sos_gesture_state = {
     "is_palm_open": False,
     "palm_start_time": None,
@@ -80,8 +73,6 @@ passenger_sos_gesture_state = {
 EYE_AR_THRESH = 0.20  # Below this indicates drowsiness (FaceMesh EAR range: 0.0-0.4)
 MOUTH_AR_THRESH = 0.08  # Above this indicates yawning (FaceMesh MAR range: 0.0-0.4, typically 0.03-0.10)
 HEAD_TURN_THRESH = 20  # Degrees from center
-SOS_DURATION_THRESH = 2.0  # Seconds to hold palm for SOS trigger
-PASSENGER_SOS_DURATION_THRESH = float(os.getenv("PASSENGER_SOS_DURATION_THRESH", "5.0"))
 
 # Driver personalization: Cache for thresholds (to avoid backend calls every frame)
 driver_thresholds_cache = {}  # {driver_id: {ear_drowsiness, mar_yawning, head_turn, cached_at}}
@@ -343,34 +334,9 @@ def _get_cached_thresholds(driver_id: str) -> Dict[str, float]:
         "head_turn": HEAD_TURN_THRESH
     }
 
-# MediaPipe Hand Landmarker (lazy initialization)
-hand_landmarker = None
-hand_landmarker_init_attempted = False  # Flag to avoid repeated warnings
-
 # MediaPipe Pose Landmarker (lazy initialization) for crossed-arms SOS gesture
 pose_landmarker = None
 pose_landmarker_init_attempted = False
-
-
-def _ensure_hand_landmarker_model_path() -> Optional[str]:
-    """Resolve `hand_landmarker.task` (repo-local, cache, or download)."""
-    local_path = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
-    if os.path.exists(local_path):
-        return local_path
-    cache_path = os.path.join(tempfile.gettempdir(), "hand_landmarker.task")
-    if os.path.exists(cache_path):
-        return cache_path
-    try:
-        url = (
-            "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
-            "hand_landmarker/float16/1/hand_landmarker.task"
-        )
-        print(f"Downloading hand landmarker model to {cache_path}...")
-        urllib.request.urlretrieve(url, cache_path)
-        return cache_path
-    except Exception as e:
-        print(f"⚠ Could not download hand landmarker model: {e}")
-        return None
 
 
 def _ensure_pose_landmarker_model_path() -> Optional[str]:
@@ -430,22 +396,6 @@ def _bbox_array_to_dict(bbox: Any) -> Optional[Dict[str, int]]:
     if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
         return {"x": int(bbox[0]), "y": int(bbox[1]), "w": int(bbox[2]), "h": int(bbox[3])}
     return None
-
-
-def _wrist_in_expanded_bbox(
-    wrist_nx: float,
-    wrist_ny: float,
-    bbox: Dict[str, int],
-    iw: int,
-    ih: int,
-    margin: float = 0.55,
-) -> bool:
-    """Normalized wrist (0..1) inside face bbox expanded for arm reach."""
-    cx = wrist_nx * float(iw)
-    cy = wrist_ny * float(ih)
-    bx, by, bw, bh = bbox["x"], bbox["y"], bbox["w"], bbox["h"]
-    mx, my = float(bw) * margin, float(bh) * margin
-    return (bx - mx) <= cx <= (bx + bw + mx) and (by - my) <= cy <= (by + bh + my)
 
 
 def _norm_dist(a, b) -> float:
@@ -509,241 +459,6 @@ def _detect_crossed_arms_info(image: np.ndarray) -> Dict[str, Any]:
 def _euclidean_distance(p1: np.ndarray, p2: np.ndarray) -> float:
     """Calculate Euclidean distance between two points."""
     return float(np.linalg.norm(p1 - p2))
-
-
-def _get_hand_landmarker():
-    """
-    Lazy initialization of hand landmarker.
-    Returns None if MediaPipe is not available.
-    """
-    global hand_landmarker, hand_landmarker_init_attempted
-    
-    if not MEDIAPIPE_AVAILABLE:
-        return None
-    
-    # Return cached result (success or failure)
-    if hand_landmarker_init_attempted:
-        return hand_landmarker
-    
-    hand_landmarker_init_attempted = True
-    
-    if hand_landmarker is None:
-        try:
-            model_path = _ensure_hand_landmarker_model_path()
-            if not model_path:
-                print("⚠ MediaPipe Hands: model path unavailable (SOS gesture detection disabled)")
-                return None
-            base_options = python.BaseOptions(model_asset_path=model_path)
-            options = vision.HandLandmarkerOptions(
-                base_options=base_options,
-                running_mode=vision.RunningMode.IMAGE,
-                num_hands=4,
-                min_hand_detection_confidence=0.42,
-                min_hand_presence_confidence=0.42,
-                min_tracking_confidence=0.42,
-            )
-            hand_landmarker = vision.HandLandmarker.create_from_options(options)
-            print("✓ MediaPipe Hands initialized successfully")
-        except Exception as e:
-            print(f"⚠ Warning: Could not create HandLandmarker: {e}")
-            return None
-    
-    return hand_landmarker
-
-
-def _is_palm_open(hand_landmarks) -> bool:
-    """
-    Check if palm is open (all fingers extended).
-    Uses fingertip vs base landmark positions.
-    """
-    if not hand_landmarks or len(hand_landmarks) < 21:
-        return False
-    
-    # MediaPipe hand landmark indices:
-    # 0: Wrist, 4: Thumb tip, 8: Index tip, 12: Middle tip, 16: Ring tip, 20: Pinky tip
-    # 2: Thumb base, 5: Index base, 9: Middle base, 13: Ring base, 17: Pinky base
-    
-    wrist = hand_landmarks[0]
-    
-    # Check each finger (except thumb, different geometry)
-    fingers_extended = 0
-    
-    # Index finger
-    if hand_landmarks[8].y < hand_landmarks[5].y:  # Tip above base
-        fingers_extended += 1
-    
-    # Middle finger
-    if hand_landmarks[12].y < hand_landmarks[9].y:
-        fingers_extended += 1
-    
-    # Ring finger
-    if hand_landmarks[16].y < hand_landmarks[13].y:
-        fingers_extended += 1
-    
-    # Pinky finger
-    if hand_landmarks[20].y < hand_landmarks[17].y:
-        fingers_extended += 1
-    
-    # Thumb (check horizontal extension)
-    thumb_extended = abs(hand_landmarks[4].x - wrist.x) > abs(hand_landmarks[2].x - wrist.x)
-    
-    # Palm is open if at least 4 fingers are extended (including thumb)
-    return fingers_extended >= 3 and thumb_extended
-
-
-def _detect_sos_gesture(
-    image: np.ndarray,
-    trip_id: str,
-    palm_open_info: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """
-    Detect SOS hand gesture (open palm held for > 2 seconds).
-    Returns: {sos_detected, sos_triggered, palm_open, duration}
-    """
-    global sos_gesture_state
-
-    # This function only uses the driver/any SOS timer.
-    # Passenger SOS uses a separate state and is implemented in `_detect_passenger_sos_gesture`.
-    if palm_open_info is None:
-        palm_open_info = _detect_palm_open_info(image)
-    if "error" in palm_open_info and palm_open_info["error"]:
-        return {
-            "type": "sos_gesture",
-            "person": "driver",
-            "sos_detected": False,
-            "sos_triggered": False,
-            "palm_open": False,
-            "duration": 0.0,
-            "message": palm_open_info.get("message", "MediaPipe Hands not available"),
-            "error": palm_open_info.get("error"),
-        }
-
-    palm_signal = bool(
-        palm_open_info.get("driver_palm_effective", palm_open_info.get("palm_open", False))
-    )
-    hands_detected = int(palm_open_info.get("hands_detected", 0))
-
-    current_time = time.time()
-
-    if palm_signal:
-        if not sos_gesture_state["is_palm_open"] or sos_gesture_state["trip_id"] != trip_id:
-            sos_gesture_state["is_palm_open"] = True
-            sos_gesture_state["palm_start_time"] = current_time
-            sos_gesture_state["trip_id"] = trip_id
-
-        duration = current_time - sos_gesture_state["palm_start_time"]
-        sos_triggered = duration >= SOS_DURATION_THRESH
-        return {
-            "type": "sos_gesture",
-            "person": "driver",
-            "sos_detected": True,
-            "sos_triggered": sos_triggered,
-            "palm_open": True,
-            "duration": round(duration, 2),
-            "hands_detected": hands_detected,
-        }
-
-    # Reset state if palm is not open
-    sos_gesture_state["is_palm_open"] = False
-    sos_gesture_state["palm_start_time"] = None
-    return {
-        "type": "sos_gesture",
-        "person": "driver",
-        "sos_detected": False,
-        "sos_triggered": False,
-        "palm_open": False,
-        "duration": 0.0,
-        "hands_detected": hands_detected,
-    }
-
-
-def _detect_palm_open_info(
-    image: np.ndarray,
-    driver_bbox: Optional[Dict[str, int]] = None,
-    passenger_bboxes: Optional[List[Dict[str, int]]] = None,
-) -> Dict[str, Any]:
-    """
-    Detect open palm(s) with MediaPipe Hands and optional spatial attribution
-    to driver vs passenger face regions (for separate SOS timers).
-    """
-    landmarker = _get_hand_landmarker()
-    if landmarker is None:
-        return {
-            "palm_open": False,
-            "driver_palm_open": False,
-            "passenger_palm_open": False,
-            "driver_palm_effective": False,
-            "passenger_palm_effective": False,
-            "hands_detected": 0,
-            "error": None,
-            "message": "MediaPipe Hands not available",
-        }
-
-    if image is None or image.size == 0:
-        return {
-            "palm_open": False,
-            "driver_palm_open": False,
-            "passenger_palm_open": False,
-            "driver_palm_effective": False,
-            "passenger_palm_effective": False,
-            "hands_detected": 0,
-            "error": None,
-            "message": None,
-        }
-
-    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    ih, iw = rgb_image.shape[:2]
-    try:
-        if mp_image is None:
-            raise RuntimeError("mediapipe Image not available")
-        mp_img = mp_image.Image(image_format=mp_image.ImageFormat.SRGB, data=rgb_image)
-        results = landmarker.detect(mp_img)
-    except Exception as e:
-        return {
-            "palm_open": False,
-            "driver_palm_open": False,
-            "passenger_palm_open": False,
-            "driver_palm_effective": False,
-            "passenger_palm_effective": False,
-            "hands_detected": 0,
-            "error": str(e),
-            "message": "Hand detection error",
-        }
-
-    palm_open = False
-    driver_palm_open = False
-    passenger_palm_open = False
-    hands_detected = len(results.hand_landmarks) if results.hand_landmarks else 0
-    pboxes = passenger_bboxes or []
-
-    if results.hand_landmarks:
-        for hand_landmarks in results.hand_landmarks:
-            if not _is_palm_open(hand_landmarks):
-                continue
-            palm_open = True
-            wrist = hand_landmarks[0]
-            wx, wy = float(wrist.x), float(wrist.y)
-            if driver_bbox and _wrist_in_expanded_bbox(wx, wy, driver_bbox, iw, ih):
-                driver_palm_open = True
-            for pb in pboxes:
-                if _wrist_in_expanded_bbox(wx, wy, pb, iw, ih):
-                    passenger_palm_open = True
-                    break
-
-    has_passengers = len(pboxes) > 0
-    driver_palm_effective = bool(driver_palm_open or (not has_passengers and palm_open))
-    passenger_palm_effective = bool(has_passengers and passenger_palm_open)
-
-    return {
-        "palm_open": palm_open,
-        "driver_palm_open": driver_palm_open,
-        "passenger_palm_open": passenger_palm_open,
-        "driver_palm_effective": driver_palm_effective,
-        "passenger_palm_effective": passenger_palm_effective,
-        "hands_detected": hands_detected,
-        "error": None,
-        "message": None,
-    }
 
 
 def _detect_passenger_sos_gesture(
@@ -1984,7 +1699,6 @@ def compute_risk() -> Any:
             "message": callback_message,
         },
     }), 200
-
 
 if __name__ == "__main__":
     port = int(os.getenv("AI_ENGINE_PORT", "5001"))
