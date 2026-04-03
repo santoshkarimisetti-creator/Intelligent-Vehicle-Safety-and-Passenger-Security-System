@@ -26,6 +26,8 @@ class DriverSession:
     session_key: str
     active_driver_id: str
 
+    started_at: float = 0.0
+
     locked: bool = False
     locked_driver_id: Optional[str] = None
     locked_confidence: float = 0.0
@@ -35,6 +37,13 @@ class DriverSession:
     thresholds_loaded_at: float = 0.0
 
     last_seen_at: float = 0.0
+
+    # Identity visibility tracking (fixed identity per session)
+    frame_counter: int = 0
+    last_driver_seen_at: float = 0.0
+
+    # Fixed driver encoding captured during calibration (stored on driver:{driver_id} session)
+    driver_encoding: Optional[list[float]] = None
 
 
 class DriverSessionManager:
@@ -59,6 +68,109 @@ class DriverSessionManager:
         }
 
         self._sessions: Dict[str, DriverSession] = {}
+
+    def tick_frame(
+        self,
+        *,
+        session_key: str,
+        fallback_driver_id: str,
+        now: Optional[float] = None,
+    ) -> DriverSession:
+        ts = float(now if now is not None else time.time())
+        self._expire_old(ts)
+
+        sess = self._sessions.get(session_key)
+        if sess is None:
+            sess = DriverSession(
+                session_key=session_key,
+                active_driver_id=fallback_driver_id,
+                started_at=ts,
+                last_seen_at=ts,
+                last_driver_seen_at=0.0,
+                frame_counter=0,
+            )
+            self._sessions[session_key] = sess
+
+        if not float(getattr(sess, "started_at", 0.0) or 0.0):
+            sess.started_at = ts
+
+        sess.last_seen_at = ts
+        sess.frame_counter = int(sess.frame_counter) + 1
+        return sess
+
+    def update_last_driver_seen(
+        self,
+        *,
+        session_key: str,
+        fallback_driver_id: str,
+        now: Optional[float] = None,
+    ) -> float:
+        ts = float(now if now is not None else time.time())
+        self._expire_old(ts)
+
+        sess = self._sessions.get(session_key)
+        if sess is None:
+            sess = DriverSession(
+                session_key=session_key,
+                active_driver_id=fallback_driver_id,
+                started_at=ts,
+                last_seen_at=ts,
+                last_driver_seen_at=ts,
+            )
+            self._sessions[session_key] = sess
+        if not float(getattr(sess, "started_at", 0.0) or 0.0):
+            sess.started_at = ts
+        sess.last_seen_at = ts
+        sess.last_driver_seen_at = ts
+        return ts
+
+    def get_last_driver_seen(
+        self,
+        *,
+        session_key: str,
+    ) -> float:
+        sess = self._sessions.get(session_key)
+        if sess is None:
+            return 0.0
+        return float(sess.last_driver_seen_at or 0.0)
+
+    def set_driver_encoding(
+        self,
+        *,
+        driver_id: str,
+        encoding: list[float],
+        now: Optional[float] = None,
+    ) -> bool:
+        """Store a single fixed driver encoding for this process lifetime.
+
+        Stored under the synthetic session_key `driver:{driver_id}` so it can be
+        reused across trips without ever reassigning identity.
+
+        Returns True when encoding was set, False if one already existed.
+        """
+        ts = float(now if now is not None else time.time())
+        self._expire_old(ts)
+
+        key = f"driver:{str(driver_id)}"
+        sess = self._sessions.get(key)
+        if sess is None:
+            sess = DriverSession(session_key=key, active_driver_id=str(driver_id), last_seen_at=ts)
+            self._sessions[key] = sess
+
+        sess.last_seen_at = ts
+        if sess.driver_encoding is not None:
+            return False
+
+        sess.driver_encoding = list(encoding)
+        # Seed last seen for the driver-level session.
+        sess.last_driver_seen_at = ts
+        return True
+
+    def get_driver_encoding(self, *, driver_id: str) -> Optional[list[float]]:
+        sess = self._sessions.get(f"driver:{str(driver_id)}")
+        if sess is None:
+            return None
+        return sess.driver_encoding
 
     def observe_identity(
         self,

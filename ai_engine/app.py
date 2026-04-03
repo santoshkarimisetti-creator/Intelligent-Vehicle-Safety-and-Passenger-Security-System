@@ -59,6 +59,15 @@ BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:5000")
 DEFAULT_AI_SOURCE = "ai_engine"
 NO_ACTIVE_TRIP_ID = os.getenv("NO_ACTIVE_TRIP_ID", "NO_ACTIVE_TRIP")
 
+# Fixed identity matching configuration
+IDENTITY_MATCH_EVERY_N_FRAMES = int(os.getenv("IDENTITY_MATCH_EVERY_N_FRAMES", "20"))
+IDENTITY_MATCH_TOLERANCE = float(os.getenv("IDENTITY_MATCH_TOLERANCE", "0.5"))
+DRIVER_NOT_VISIBLE_AFTER_S = float(os.getenv("DRIVER_NOT_VISIBLE_AFTER_S", "3.0"))
+
+_trip_driver_cache: Dict[str, Dict[str, Any]] = {}
+_trip_driver_cache_lock = threading.Lock()
+_trip_driver_cache_ttl_s = float(os.getenv("TRIP_DRIVER_CACHE_TTL", "600"))
+
 # Face metrics are produced by MediaPipe FaceMesh in landmark_engine.py
 
 # Passenger SOS gesture state.
@@ -153,10 +162,178 @@ def _get_cached_analytics_state(session_key: str) -> Dict[str, Any]:
 
 
 def _get_driver_id_from_trip(trip_id: str) -> str:
-    """Extract or derive driver_id from trip_id (or use trip_id as default)."""
-    # In a real system, query backend to get driver_id from trip
-    # For now, use trip_id as driver identifier
-    return trip_id or "unknown_driver"
+    """Resolve driver_id for a trip.
+
+    Uses backend `/trips/<trip_id>` when available and caches the result.
+    Falls back to using trip_id (legacy behavior).
+    """
+    tid = str(trip_id or "").strip()
+    if not tid:
+        return "unknown_driver"
+
+    now = time.time()
+    with _trip_driver_cache_lock:
+        cached = _trip_driver_cache.get(tid)
+        if cached and (now - float(cached.get("cached_at", 0.0))) < _trip_driver_cache_ttl_s:
+            driver_id = str(cached.get("driver_id") or "").strip()
+            if driver_id:
+                return driver_id
+
+    try:
+        endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/trips/{tid}"
+        with urlopen(Request(endpoint, method="GET"), timeout=2) as response:
+            if getattr(response, "status", 200) == 200:
+                data = json.loads(response.read().decode("utf-8")) or {}
+                driver_id = str((data.get("trip") or data).get("driver_id") or "").strip()
+                if driver_id:
+                    with _trip_driver_cache_lock:
+                        _trip_driver_cache[tid] = {"driver_id": driver_id, "cached_at": now}
+                    return driver_id
+    except Exception:
+        pass
+
+    return tid
+
+
+def _bbox_iou_xywh(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    try:
+        ax1 = float(a.get("x", 0.0))
+        ay1 = float(a.get("y", 0.0))
+        ax2 = ax1 + float(a.get("w", 0.0))
+        ay2 = ay1 + float(a.get("h", 0.0))
+
+        bx1 = float(b.get("x", 0.0))
+        by1 = float(b.get("y", 0.0))
+        bx2 = bx1 + float(b.get("w", 0.0))
+        by2 = by1 + float(b.get("h", 0.0))
+
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+
+        iw = max(0.0, ix2 - ix1)
+        ih = max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0.0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        if union <= 0.0:
+            return 0.0
+        return float(inter / union)
+    except Exception:
+        return 0.0
+
+
+def _pick_embedding_for_target(
+    *,
+    embeddings: List[Tuple[Dict[str, int], np.ndarray]],
+    target_bbox: Optional[Dict[str, Any]],
+) -> Optional[np.ndarray]:
+    if not embeddings:
+        return None
+    if target_bbox:
+        best_iou = -1.0
+        best = None
+        for bbox, emb in embeddings:
+            iou = _bbox_iou_xywh(target_bbox, bbox)
+            if iou > best_iou:
+                best_iou = iou
+                best = emb
+        return best
+
+    # Fallback: pick largest face area
+    best_area = -1
+    best = None
+    for bbox, emb in embeddings:
+        area = int(bbox.get("w", 0)) * int(bbox.get("h", 0))
+        if area > best_area:
+            best_area = area
+            best = emb
+    return best
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    try:
+        a = np.asarray(a, dtype=np.float32).reshape(-1)
+        b = np.asarray(b, dtype=np.float32).reshape(-1)
+        denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+        if denom <= 1e-8:
+            return 0.0
+        return float(np.dot(a, b) / denom)
+    except Exception:
+        return 0.0
+
+
+def _ensure_fixed_driver_encoding_from_frame(
+    *,
+    driver_id: str,
+    image_bgr: np.ndarray,
+    target_face_bbox: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Capture a single fixed encoding for driver_id (once per process)."""
+    session_mgr = get_driver_session_manager()
+    existing = session_mgr.get_driver_encoding(driver_id=str(driver_id))
+    if existing is not None:
+        return False
+
+    identity_service = get_face_recognition_service()
+    faces = identity_service.extract_face_embeddings(image_bgr)
+    emb = _pick_embedding_for_target(embeddings=faces, target_bbox=target_face_bbox)
+    if emb is None:
+        return False
+
+    flat = np.asarray(emb, dtype=np.float32).reshape(-1)
+    return session_mgr.set_driver_encoding(driver_id=str(driver_id), encoding=[float(x) for x in flat])
+
+
+def _update_fixed_identity_visibility(
+    *,
+    session_key: str,
+    driver_id: str,
+    image_bgr: np.ndarray,
+    now_ts: float,
+) -> Dict[str, Any]:
+    """Periodic identity match to a fixed encoding; never reassigns driver."""
+    session_mgr = get_driver_session_manager()
+    sess = session_mgr.tick_frame(session_key=session_key, fallback_driver_id=str(driver_id), now=now_ts)
+
+    encoding_list = session_mgr.get_driver_encoding(driver_id=str(driver_id))
+    last_seen = float(session_mgr.get_last_driver_seen(session_key=session_key) or 0.0)
+    checked = False
+    matched_this_check = False
+
+    # Run identity matching only every N frames (including the first frame).
+    every_n = max(1, int(IDENTITY_MATCH_EVERY_N_FRAMES))
+    if encoding_list is not None and (int(sess.frame_counter) % every_n == 0):
+        checked = True
+        known = np.asarray(encoding_list, dtype=np.float32).reshape(1, -1)
+
+        identity_service = get_face_recognition_service()
+        faces = identity_service.extract_face_embeddings(image_bgr)
+        for _, emb in faces:
+            sim = _cosine_similarity(np.asarray(emb, dtype=np.float32), known)
+            dist = 1.0 - sim
+            if dist <= float(IDENTITY_MATCH_TOLERANCE):
+                matched_this_check = True
+                last_seen = float(session_mgr.update_last_driver_seen(
+                    session_key=session_key,
+                    fallback_driver_id=str(driver_id),
+                    now=now_ts,
+                ))
+                break
+
+    matched_recently = bool(last_seen > 0.0 and (now_ts - last_seen) <= float(DRIVER_NOT_VISIBLE_AFTER_S))
+
+    return {
+        "identity_checked": checked,
+        "identity_matched": matched_this_check,
+        "driver_encoding_set": encoding_list is not None,
+        "last_driver_seen_at": last_seen,
+        "driver_matched_recently": matched_recently,
+    }
 
 
 def _parse_iso_utc(value: Optional[str]) -> Optional[datetime]:
@@ -730,60 +907,14 @@ def _run_slow_analytics(
         face_detected = bool(cv_metrics.get("face_detected", False))
 
         # Slow analytics task 1: session-level identity management.
-        # - initial identification once a face is present
-        # - periodic verification every IDENTITY_VERIFY_INTERVAL_S
-        # - trigger re-identification on mismatch/failure
-        locked = bool(identity_session.get("locked", False))
-        last_verified_ts = float(identity_session.get("last_verified_ts", 0.0) or 0.0)
-        reidentify_required = bool(identity_session.get("reidentify_required", False))
-
-        should_identify = False
-        if not locked:
-            should_identify = face_detected
-        else:
-            should_identify = reidentify_required or ((now_ts - last_verified_ts) >= float(IDENTITY_VERIFY_INTERVAL_S))
-
-        if should_identify:
-            identity_service = get_face_recognition_service()
-            identity = identity_service.identify_driver(
-                image_bgr=image_bgr,
-                target_face_bbox=cv_metrics.get("face_bbox"),
-            )
-            identity_session["last_attempt_ts"] = now_ts
-
-            matched = bool(identity.matched)
-            found_driver_id = str(identity.driver_id or "").strip() or None
-            found_conf = round(float(identity.confidence), 3)
-
-            if (not locked) and matched and found_driver_id:
-                identity_session["locked"] = True
-                identity_session["driver_id"] = found_driver_id
-                identity_session["confidence"] = found_conf
-                identity_session["last_verified_ts"] = now_ts
-                identity_session["reidentify_required"] = False
-                identity_session["status"] = "VERIFIED"
-                identity_session["mismatch_count"] = 0
-            elif (not locked) and (not matched):
-                identity_session["status"] = "INITIAL_IDENTIFICATION_FAILED"
-                identity_session["reidentify_required"] = True
-            elif locked and matched and found_driver_id == identity_session.get("driver_id"):
-                identity_session["confidence"] = found_conf
-                identity_session["last_verified_ts"] = now_ts
-                identity_session["reidentify_required"] = False
-                identity_session["status"] = "VERIFIED"
-            elif locked and matched and found_driver_id and found_driver_id != identity_session.get("driver_id"):
-                identity_session["locked"] = False
-                identity_session["reidentify_required"] = True
-                identity_session["status"] = "REIDENTIFY_REQUIRED"
-                identity_session["mismatch_count"] = int(identity_session.get("mismatch_count", 0) or 0) + 1
-                identity_session["driver_id"] = None
-                identity_session["confidence"] = 0.0
-            else:
-                identity_session["locked"] = False
-                identity_session["reidentify_required"] = True
-                identity_session["status"] = "VERIFY_FAILED"
-                identity_session["driver_id"] = None
-                identity_session["confidence"] = 0.0
+        # Disabled: fixed identity is enforced via a single calibration encoding and
+        # periodic matching in the fast loop. This prevents any automatic driver
+        # assignment/reassignment in the background worker.
+        identity_session["locked"] = False
+        identity_session["driver_id"] = None
+        identity_session["confidence"] = 0.0
+        identity_session["reidentify_required"] = False
+        identity_session["status"] = "DISABLED_FIXED_IDENTITY"
 
         identity_payload = {
             "driver_id": identity_session.get("driver_id"),
@@ -922,7 +1053,16 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Landmark-based detection with personalized thresholds
         image = _decode_image(image_data)
         if image is not None:
+            now_ts = time.time()
             cv_metrics = _process_frame_with_landmarks(image)
+
+            # Session tick (for frame counters + started_at)
+            session_mgr = get_driver_session_manager()
+            sess = session_mgr.tick_frame(
+                session_key=session_key,
+                fallback_driver_id=fallback_driver_id,
+                now=now_ts,
+            )
 
             # Read latest cached slow analytics state and schedule refresh if due.
             cached_analytics = _get_cached_analytics_state(session_key)
@@ -933,16 +1073,67 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
                 cv_metrics=cv_metrics,
             )
 
-            identity_info = cached_analytics.get("identity") or {}
-            identity_session = cached_analytics.get("identity_session") or {}
-            active_driver_id = (
-                str(identity_session.get("driver_id") or identity_info.get("driver_id") or "").strip()
-                if bool(identity_session.get("locked", identity_info.get("matched", False)))
-                else ""
-            ) or fallback_driver_id
+            # Fixed identity: use only the trip's resolved driver id.
+            # Never auto-assign a new driver.
+            active_driver_id = fallback_driver_id
+
+            # Periodic identity verification against the fixed calibration encoding.
+            fixed_identity: Dict[str, Any] = {
+                "driver_id": active_driver_id,
+                "matched": False,
+                "matched_this_frame": False,
+                "attempted": False,
+                "similarity": None,
+                "status": "NO_ENCODING",
+            }
+
+            driver_encoding = session_mgr.get_driver_encoding(driver_id=active_driver_id)
+            if driver_encoding is not None:
+                fixed_identity["status"] = "ENCODING_AVAILABLE"
+
+                should_match = (
+                    int(getattr(sess, "frame_counter", 0) or 0) <= 1
+                    or ((int(getattr(sess, "frame_counter", 0) or 0) - 1) % max(1, int(IDENTITY_MATCH_EVERY_N_FRAMES)) == 0)
+                )
+
+                similarity: Optional[float] = None
+                if should_match:
+                    fixed_identity["attempted"] = True
+                    try:
+                        identity_service = get_face_recognition_service()
+                        embeddings = identity_service.extract_face_embeddings(image)
+                        target_bbox = _driver_bbox_from_faces_meta(cv_metrics.get("faces_meta", []) or [], cv_metrics)
+                        picked = _pick_embedding_for_target(embeddings=embeddings, target_bbox=target_bbox)
+                        if picked is not None:
+                            known = np.asarray(driver_encoding, dtype=np.float32).reshape(-1)
+                            similarity = _cosine_similarity(np.asarray(picked, dtype=np.float32), known)
+                            fixed_identity["similarity"] = round(float(similarity), 4)
+                            if float(similarity) >= float(IDENTITY_MATCH_TOLERANCE):
+                                fixed_identity["matched_this_frame"] = True
+                                session_mgr.update_last_driver_seen(
+                                    session_key=session_key,
+                                    fallback_driver_id=active_driver_id,
+                                    now=now_ts,
+                                )
+                    except Exception:
+                        fixed_identity["status"] = "MATCH_ERROR"
+
+                last_seen = float(session_mgr.get_last_driver_seen(session_key=session_key) or 0.0)
+                if last_seen > 0.0:
+                    unseen_s = max(0.0, float(now_ts - last_seen))
+                else:
+                    # Grace period: before the first confirmed match, count from session start.
+                    unseen_s = max(0.0, float(now_ts - float(getattr(sess, "started_at", now_ts) or now_ts)))
+
+                cv_metrics["driver_last_seen_s_ago"] = float(unseen_s)
+                cv_metrics["driver_matched_recently"] = bool(unseen_s <= float(DRIVER_NOT_VISIBLE_AFTER_S))
+
+                fixed_identity["matched"] = bool(cv_metrics["driver_matched_recently"])
+                fixed_identity["last_seen_s_ago"] = round(float(unseen_s), 3)
+                if similarity is not None:
+                    fixed_identity["status"] = "MATCHED" if fixed_identity["matched_this_frame"] else "NOT_MATCHED"
 
             # Load thresholds for the active driver (session-cached)
-            session_mgr = get_driver_session_manager()
             thresholds = session_mgr.get_thresholds(
                 session_key=session_key,
                 driver_id=active_driver_id,
@@ -965,7 +1156,7 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
             detection_result["passengers"] = [m for m in faces_meta if m.get("role") == "passenger"]
 
             # Heavy analytics outputs are sourced from cached slow loop.
-            detection_result["identity"] = identity_info
+            detection_result["identity"] = fixed_identity
             detection_result["session"] = session_mgr.export_session(session_key=session_key)
             detection_result["emotion"] = cached_analytics.get("emotion_result", _empty_emotion_placeholder())
             detection_result["passenger_emotions"] = cached_analytics.get("passenger_emotions", [])
@@ -1014,7 +1205,7 @@ def _compute_detection(payload: Dict[str, Any]) -> Dict[str, Any]:
             detection_result["personalization"] = {
                 "driver_id": active_driver_id,
                 "thresholds_used": thresholds,
-                "identity_locked": bool(identity_info.get("matched", False)),
+                "identity_locked": bool(fixed_identity.get("matched", False)),
             }
             
             detection_result["sos_gesture"] = passenger_sos_result
@@ -1417,6 +1608,22 @@ def submit_driver_calibration_frame(driver_id: str) -> Any:
         return jsonify({"error": "failed to decode image"}), 400
 
     cv_metrics = _process_frame_with_landmarks(image)
+
+    # Fixed identity capture: store a single driver encoding during calibration.
+    try:
+        session_mgr = get_driver_session_manager()
+        if session_mgr.get_driver_encoding(driver_id=driver_id) is None:
+            identity_service = get_face_recognition_service()
+            embeddings = identity_service.extract_face_embeddings(image)
+            target_bbox = _driver_bbox_from_faces_meta(cv_metrics.get("faces_meta", []) or [], cv_metrics)
+            picked = _pick_embedding_for_target(embeddings=embeddings, target_bbox=target_bbox)
+            if picked is not None:
+                enc = np.asarray(picked, dtype=np.float32).reshape(-1).tolist()
+                session_mgr.set_driver_encoding(driver_id=driver_id, encoding=[float(x) for x in enc])
+    except Exception:
+        # Do not fail calibration if identity capture isn't available.
+        pass
+
     engine = get_calibration_engine()
     try:
         progress = engine.add_metrics(

@@ -122,6 +122,7 @@ class BehaviorEngine:
         self._blink_event_max_s = float(os.getenv("BLINK_EVENT_MAX_SECONDS", "0.8"))
         self._blink_window_s = float(os.getenv("BLINK_WINDOW_SECONDS", "60.0"))
         self._face_missing_warn_s = float(os.getenv("FACE_MISSING_WARN_SECONDS", "2.0"))
+        self._driver_not_visible_after_s = float(os.getenv("DRIVER_NOT_VISIBLE_AFTER_S", "3.0"))
         self._camera_blocked_crit_s = float(os.getenv("CAMERA_BLOCKED_CRITICAL_SECONDS", "5.0"))
         self._too_far_warn_s = float(os.getenv("TOO_FAR_WARN_SECONDS", "2.0"))
         self._min_face_presence_conf = float(os.getenv("MIN_FACE_PRESENCE_CONF", "0.5"))
@@ -198,6 +199,59 @@ class BehaviorEngine:
 
         face_detected = bool(cv_metrics.get("face_detected"))
         low_quality_face = (face_presence_conf < self._min_face_presence_conf)
+
+        # Fixed identity visibility (preferred): app.py provides the driver's last-seen age
+        # based on periodic matching against a single calibration encoding.
+        unseen_s_raw = cv_metrics.get("driver_last_seen_s_ago")
+        if unseen_s_raw is not None:
+            try:
+                unseen_s = max(0.0, float(unseen_s_raw))
+            except (TypeError, ValueError):
+                unseen_s = 0.0
+
+            if unseen_s >= float(self._driver_not_visible_after_s):
+                self._clear_for_no_face(driver_id=driver_id, st=state, now=now)
+                return {
+                    "detections": [
+                        {
+                            "type": "driver_not_visible",
+                            "confidence": 1.0,
+                            "source": "behavior_engine",
+                            "metric": "driver_last_seen_s_ago",
+                            "value": round(float(unseen_s), 2),
+                            "threshold": round(float(self._driver_not_visible_after_s), 2),
+                            "duration_s": round(float(unseen_s), 2),
+                        }
+                    ],
+                    "smoothed_metrics": {
+                        "ear": 0.0,
+                        "mar": 0.0,
+                        "yaw_angle": 0.0,
+                    },
+                    "raw_scores": {
+                        "eyes_closed_score": 0.0,
+                        "head_off_road_score": 0.0,
+                        "yawning_score": 0.0,
+                    },
+                }
+
+            # Within grace window (< 3s since last match): do not emit driver_not_visible,
+            # but also do not run temporal behavior scoring if the face isn't reliably detected.
+            if (not face_detected) or low_quality_face:
+                self._clear_for_no_face(driver_id=driver_id, st=state, now=now)
+                return {
+                    "detections": [],
+                    "smoothed_metrics": {
+                        "ear": 0.0,
+                        "mar": 0.0,
+                        "yaw_angle": 0.0,
+                    },
+                    "raw_scores": {
+                        "eyes_closed_score": 0.0,
+                        "head_off_road_score": 0.0,
+                        "yawning_score": 0.0,
+                    },
+                }
         distance_ok_score = 0.0
         if face_area_ratio > 0.0:
             distance_ok_score += 0.6 * min(1.0, face_area_ratio / max(self._too_far_face_area_ratio, 1e-6))
