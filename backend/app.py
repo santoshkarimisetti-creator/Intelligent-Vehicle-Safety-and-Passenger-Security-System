@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import uuid
 from math import radians, sin, cos, sqrt, atan2, log, tan, pi
@@ -61,6 +61,73 @@ trips_collection = db["trips"]
 events_collection = db["events"]  # For detections when no active trip
 
 IST_ZONE = ZoneInfo("Asia/Kolkata")
+
+AUTO_STOP_ACTIVE_TRIP_AFTER_HOURS = float(os.getenv("AUTO_STOP_ACTIVE_TRIP_AFTER_HOURS", "24"))
+AUTO_STOP_LABEL = os.getenv("AUTO_STOP_LABEL", "manually stopped after 24 hours")
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.utcnow().replace(tzinfo=None)
+
+
+def _trip_start_utc_naive(trip: dict) -> datetime | None:
+    start_time = trip.get("start_time")
+    if isinstance(start_time, datetime):
+        dt = start_time
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    if isinstance(start_time, str):
+        return _parse_iso_to_utc_naive(start_time)
+    return None
+
+
+def _auto_stop_active_trips_over_24h() -> int:
+    """Mark ACTIVE trips older than 24 hours as completed.
+
+    This prevents a stuck ACTIVE trip from capturing all future AI events.
+    """
+    now = _utcnow_naive()
+    stopped = 0
+
+    try:
+        active_trips = list(
+            trips_collection.find(
+                {"status": "ACTIVE"},
+                {"_id": 1, "trip_id": 1, "start_time": 1, "end_time": 1, "status": 1},
+            )
+        )
+    except Exception:
+        return 0
+
+    for trip in active_trips:
+        start_dt = _trip_start_utc_naive(trip)
+        if not start_dt:
+            continue
+        age_h = (now - start_dt).total_seconds() / 3600.0
+        if age_h <= float(AUTO_STOP_ACTIVE_TRIP_AFTER_HOURS):
+            continue
+
+        try:
+            trips_collection.update_one(
+                {"_id": trip.get("_id"), "status": "ACTIVE"},
+                {
+                    "$set": {
+                        "status": "COMPLETED",
+                        "end_time": trip.get("end_time") or now.isoformat(),
+                        "stop_label": str(AUTO_STOP_LABEL),
+                        "stop_reason": "AUTO_STOP_24H",
+                        "stopped_by": "system",
+                        "stopped_at": now.isoformat(),
+                    }
+                },
+            )
+            stopped += 1
+        except Exception:
+            # Best-effort; don't break normal API responses.
+            pass
+
+    return stopped
 
 
 def to_ist_display(value):
@@ -886,6 +953,7 @@ def download_trip_report_pdf(trip_id: str):
 def add_ai_result(trip_id):
     """Receive AI-engine detection/risk result and attach it to trip record."""
     try:
+        _auto_stop_active_trips_over_24h()
         trip = trips_collection.find_one({"trip_id": trip_id})
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
@@ -1439,6 +1507,7 @@ def get_trip_live_map(trip_id):
 def is_active_trip(trip_id):
     """Check if trip is currently active."""
     try:
+        _auto_stop_active_trips_over_24h()
         trip = trips_collection.find_one({"trip_id": trip_id})
         if not trip:
             return jsonify({"is_active": False, "message": "Trip not found"}), 200
@@ -1479,7 +1548,7 @@ def add_event():
 
         # Reject generic empty frames regardless of risk-level bucket to avoid
         # filling DB with synthetic DETECTION rows that have no actual detections.
-        if (not labels) and (not is_sos) and is_generic_type:
+        if (not labels) and (not is_sos) and is_generic_type and event_action != "start":
             return jsonify({"message": "No detections; event skipped"}), 200
         
         # Additional strict check: if completely empty and not SOS/high-risk, skip it

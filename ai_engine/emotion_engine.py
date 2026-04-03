@@ -394,11 +394,17 @@ class EmotionEngine:
         # Append to timeline
         if session_key not in self._emotion_timeline_by_session:
             self._emotion_timeline_by_session[session_key] = []
-        self._emotion_timeline_by_session[session_key].append({
+        
+        timeline = self._emotion_timeline_by_session[session_key]
+        timeline.append({
             "timestamp": timestamp,
             "emotion": emotion,
             "confidence": confidence,
         })
+        
+        # Limit timeline size to prevent unbounded growth (keep last 100)
+        if len(timeline) > 100:
+            timeline.pop(0)
 
         return {
             "dominant_emotion": emotion,
@@ -486,6 +492,22 @@ class EmotionEngine:
                 "emotion_updated_at": 0.0,
             },
         )
+
+    def clear_session(self, session_key: str) -> None:
+        """Clear all session state when trip ends or driver session ends.
+        Prevents unbounded memory growth from session-keyed dictionaries.
+        """
+        self._cache_by_session.pop(session_key, None)
+        self._last_by_session.pop(session_key, None)
+        self._emotion_timeline_by_session.pop(session_key, None)
+        self._current_emotion_state_by_session.pop(session_key, None)
+        self._last_db_emotion_by_session.pop(session_key, None)
+        self._last_stress_emotion_by_session.pop(session_key, None)
+        self._last_stress_alert_ts_by_session.pop(session_key, None)
+        self._emotion_buffer_by_session.pop(session_key, None)
+        
+        if self.debug:
+            print(f"[{session_key}] Emotion state cleared (session/trip ended)")
 
     def _analyze_driver_placeholder(
         self,

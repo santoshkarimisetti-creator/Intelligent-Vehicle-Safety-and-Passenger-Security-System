@@ -57,6 +57,7 @@ CORS(app)
 
 BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "http://localhost:5000")
 DEFAULT_AI_SOURCE = "ai_engine"
+NO_ACTIVE_TRIP_ID = os.getenv("NO_ACTIVE_TRIP_ID", "NO_ACTIVE_TRIP")
 
 # Face metrics are produced by MediaPipe FaceMesh in landmark_engine.py
 
@@ -97,7 +98,7 @@ _analytics_lock = threading.Lock()
 _episode_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _episode_lock = threading.Lock()
 _episode_event_types = tuple(
-    t.strip() for t in os.getenv("EPISODE_EVENT_TYPES", "yawning,distraction,driver_not_visible").split(",") if t.strip()
+    t.strip().lower() for t in os.getenv("EPISODE_EVENT_TYPES", "yawning,distraction,driver_not_visible,drowsiness").split(",") if t.strip()
 )
 _episode_persist_min_s = float(os.getenv("EPISODE_PERSIST_MIN_SECONDS", "0.8"))
 _compute_risk_persist_events = str(os.getenv("COMPUTE_RISK_PERSIST_EVENTS", "0")).lower() in {"1", "true", "yes"}
@@ -1414,7 +1415,7 @@ def _is_trip_active(trip_id: str) -> bool:
     Check if a trip is currently active (backend source of truth).
     On transport errors returns False so results route to /events instead of a stale trip doc.
     """
-    if not trip_id:
+    if (not trip_id) or (str(trip_id).strip() == NO_ACTIVE_TRIP_ID):
         return False
     
     try:
@@ -1432,7 +1433,9 @@ def _post_result_to_backend(result_payload: Dict[str, Any]) -> Tuple[bool, str]:
     """Post AI results to backend. Routes to /trips/{id}/ai-results if active trip, else to /events."""
     trip_id = result_payload.get("trip_id")
     if not trip_id:
-        return False, "trip_id missing; callback skipped"
+        # Background monitoring mode: persist into /events under a fixed sentinel.
+        trip_id = NO_ACTIVE_TRIP_ID
+        result_payload["trip_id"] = trip_id
 
     try:
         is_active = _is_trip_active(trip_id)
@@ -1444,6 +1447,8 @@ def _post_result_to_backend(result_payload: Dict[str, Any]) -> Tuple[bool, str]:
         endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/trips/{trip_id}/ai-results"
     else:
         endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/events"
+        # Never leak an inactive/stale trip_id into background events.
+        result_payload["trip_id"] = NO_ACTIVE_TRIP_ID
         result_payload["is_sos"] = result_payload.get("sos_triggered", False)
 
     def _post_to(url: str) -> Tuple[int, str]:
@@ -1498,7 +1503,8 @@ def _post_sos_event_to_backend(sos_payload: Dict[str, Any]) -> Tuple[bool, str]:
     """
     trip_id = sos_payload.get("trip_id")
     if not trip_id:
-        return False, "trip_id missing"
+        trip_id = NO_ACTIVE_TRIP_ID
+        sos_payload["trip_id"] = trip_id
 
     try:
         # Check if trip is active
@@ -1511,6 +1517,7 @@ def _post_sos_event_to_backend(sos_payload: Dict[str, Any]) -> Tuple[bool, str]:
         else:
             # Route to events collection with is_sos flag
             endpoint = f"{BACKEND_BASE_URL.rstrip('/')}/events"
+            sos_payload["trip_id"] = NO_ACTIVE_TRIP_ID
             sos_payload["is_sos"] = True
 
         body = json.dumps(sos_payload).encode("utf-8")
@@ -1593,6 +1600,13 @@ def complete_trip_endpoint(trip_id: str) -> Any:
         get_driver_session_manager().reset_session(session_key=trip_id)
     except Exception:
         pass
+    
+    # Clear emotion engine session state
+    try:
+        get_emotion_engine().clear_session(trip_id)
+    except Exception:
+        pass
+    
     _reset_episode_state(session_key=trip_id)
     
     return jsonify(summary), 200
@@ -1609,6 +1623,13 @@ def reset_trip_session_endpoint(trip_id: str) -> Any:
         get_driver_session_manager().reset_session(session_key=trip_id)
     except Exception:
         pass
+    
+    # Clear emotion engine session state
+    try:
+        get_emotion_engine().clear_session(trip_id)
+    except Exception:
+        pass
+    
     _reset_episode_state(session_key=trip_id)
 
     # Also clear temporal state so detections don't carry over.
