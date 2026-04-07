@@ -5,6 +5,7 @@ const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
 
 export default function EventsPage() {
   const [events, setEvents] = useState([])
+  const [eventTypeOptions, setEventTypeOptions] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [selectedRiskLevel, setSelectedRiskLevel] = useState('')
@@ -57,21 +58,49 @@ export default function EventsPage() {
         if (start) params.set('start', start.toISOString())
         if (end) params.set('end', end.toISOString())
 
-        const response = await fetch(`${API_BASE}/events?${params.toString()}`)
+        const optionsParams = new URLSearchParams({
+          limit: '500',
+          skip: '0',
+        })
+        if (selectedRiskLevel) optionsParams.set('risk_level', selectedRiskLevel)
+        if (start) optionsParams.set('start', start.toISOString())
+        if (end) optionsParams.set('end', end.toISOString())
+
+        const [response, optionsResponse] = await Promise.all([
+          fetch(`${API_BASE}/events?${params.toString()}`),
+          fetch(`${API_BASE}/events?${optionsParams.toString()}`),
+        ])
+
         if (!response.ok) throw new Error('Failed to fetch events')
+        if (!optionsResponse.ok) throw new Error('Failed to fetch event type options')
+
         const data = await response.json()
+        const optionsData = await optionsResponse.json()
         const list = Array.isArray(data.events) ? data.events.slice() : []
         list.sort((a, b) => {
           const at = a?.received_at ? new Date(a.received_at).getTime() : (a?.timestamp ? new Date(a.timestamp).getTime() : 0)
           const bt = b?.received_at ? new Date(b.received_at).getTime() : (b?.timestamp ? new Date(b.timestamp).getTime() : 0)
           return bt - at
         })
+
+        const sourceForOptions = Array.isArray(optionsData.events) ? optionsData.events : []
+        const optionSet = new Set()
+        for (const ev of sourceForOptions) {
+          const label = String((ev?.event_label || ev?.event_type || '')).trim()
+          if (label) optionSet.add(label)
+        }
+
+        // Keep currently selected option visible even if temporarily not in current result window.
+        if (selectedEventType) optionSet.add(selectedEventType)
+
         setEvents(list)
+        setEventTypeOptions(Array.from(optionSet).sort((a, b) => a.localeCompare(b)))
         setTotalCount(data.total_count || 0)
         setError(null)
       } catch (err) {
         setError(err.message)
         setEvents([])
+        setEventTypeOptions([])
         setTotalCount(0)
       } finally {
         setLoading(false)
@@ -80,50 +109,9 @@ export default function EventsPage() {
     fetchEvents()
   }, [pageNum, selectedRiskLevel, selectedEventType, datePreset, fromDate, toDate])
 
-  const _extractLabels = (event) => {
-    const detections = event?.event_labels || event?.detections
-    const labels = []
-
-    if (Array.isArray(detections)) {
-      for (const d of detections) {
-        if (typeof d === 'string') {
-          if (d.trim()) labels.push(d.trim())
-        } else if (d && typeof d === 'object') {
-          const label = d.type || d.label || d.name || d.event
-          if (label) labels.push(String(label))
-        }
-      }
-    } else if (detections && typeof detections === 'object') {
-      for (const [k, v] of Object.entries(detections)) {
-        if (v) labels.push(k)
-      }
-    }
-
-    return [...new Set(labels.filter(Boolean))]
-  }
-
   const getEventLabel = (event) => {
-    const raw = (event?.event_type || '').trim()
-    const labels = _extractLabels(event)
-
-    // If we have multiple labels, always prefer showing them.
-    if (labels.length > 1) return labels.join(', ')
-
-    // If backend gave a meaningful type, use it.
-    if (raw && raw !== 'DETECTION' && raw !== 'AI Detection') return raw
-
-    const uniq = labels
-    if (uniq.length === 1) return uniq[0]
-    return 'Detection'
+    return String(event?.event_label || event?.event_type || 'Detection')
   }
-
-  const eventTypes = useMemo(() => {
-    const labels = []
-    for (const e of events) {
-      for (const l of _extractLabels(e)) labels.push(l)
-    }
-    return [...new Set(labels.filter(Boolean))]
-  }, [events])
 
   const totalPages = Math.max(1, Math.ceil((totalCount || 0) / itemsPerPage))
   const pageWindowStart = Math.max(1, pageBlockStart)
@@ -210,7 +198,7 @@ export default function EventsPage() {
           className="filter-select"
         >
           <option value="">All Event Types</option>
-          {eventTypes.map(type => (
+          {eventTypeOptions.map(type => (
             <option key={type} value={type}>{type}</option>
           ))}
         </select>
@@ -297,50 +285,15 @@ export default function EventsPage() {
                 </div>
 
                 <div className="event-details">
-                  <p><strong>Timestamp:</strong> {formatTimestamp(event.timestamp)}</p>
-                  <p><strong>Risk Score (Weighted):</strong> {event.risk_score_weighted?.toFixed(2) || 'N/A'}</p>
-                  {event.risk_score_temporal && (
-                    <p><strong>Risk Score (Temporal):</strong> {event.risk_score_temporal.toFixed(2)}</p>
-                  )}
+                  <p><strong>Start Time:</strong> {formatTimestamp(event.start_time)}</p>
+                  <p><strong>End Time:</strong> {formatTimestamp(event.end_time)}</p>
+                  <p><strong>Risk Score:</strong> {event.risk_score != null ? Number(event.risk_score).toFixed(2) : 'N/A'}</p>
+                  <p><strong>Emotion:</strong> {event.emotion || 'unknown'}</p>
+                  <p><strong>Confidence:</strong> {event.confidence != null ? Number(event.confidence).toFixed(2) : 'N/A'}</p>
                 </div>
-
-                {event.detections && ((Array.isArray(event.detections) && event.detections.length > 0) || (!Array.isArray(event.detections) && Object.keys(event.detections).length > 0)) && (
-                  <div className="event-detections">
-                    <strong>Detections:</strong>
-                    <ul>
-                      {Array.isArray(event.detections)
-                        ? event.detections.map((d, idx) => {
-                            if (typeof d === 'string') {
-                              return (
-                                <li key={`${d}-${idx}`}>
-                                  {d}
-                                </li>
-                              )
-                            }
-                            return (
-                              <li key={`${d?.type || 'detection'}-${idx}`}>
-                                {d?.type || 'unknown'}: <span className="detection-value">{d?.confidence != null ? `${Math.round(d.confidence * 100)}%` : 'N/A'}</span>
-                              </li>
-                            )
-                          })
-                        : Object.entries(event.detections).map(([key, val]) => (
-                            <li key={key}>
-                              {key}: <span className="detection-value">{typeof val === 'object' ? JSON.stringify(val) : String(val)}</span>
-                            </li>
-                          ))}
-                    </ul>
-                  </div>
-                )}
-
-                {event.location && (
-                  <div className="event-location">
-                    <strong>Location:</strong> {event.location.latitude?.toFixed(5)}, {event.location.longitude?.toFixed(5)}
-                  </div>
-                )}
               </div>
             ))}
           </div>
-
           <div className="pagination">
             <button 
               onClick={() => setPageBlockStart(Math.max(1, pageWindowStart - 10))}

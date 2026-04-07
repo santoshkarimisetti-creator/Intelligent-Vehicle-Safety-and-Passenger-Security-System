@@ -1463,12 +1463,21 @@ def get_active_trip_live_map():
         lat = current_point.get("lat")
         lng = current_point.get("lng", current_point.get("lon"))
 
+        start_time = trip.get("start_time")
+        if isinstance(start_time, datetime):
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            start_time_iso = start_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        else:
+            start_time_iso = None
+
         return jsonify(
             {
                 "trip_active": True,
                 "current_location": {"lat": lat, "lng": lng} if lat is not None and lng is not None else None,
                 "path": path,
                 "trip_id": trip.get("trip_id"),
+                "trip_start_time": start_time_iso,
             }
         ), 200
     except Exception as e:
@@ -1489,10 +1498,19 @@ def get_trip_live_map(trip_id):
         lat = current_point.get("lat")
         lng = current_point.get("lng", current_point.get("lon"))
 
+        start_time = trip.get("start_time")
+        if isinstance(start_time, datetime):
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            start_time_iso = start_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        else:
+            start_time_iso = None
+
         return jsonify(
             {
                 "trip_active": active,
                 "trip_id": trip.get("trip_id"),
+                "trip_start_time": start_time_iso,
                 "current_location": {"lat": lat, "lng": lng}
                 if active and lat is not None and lng is not None
                 else None,

@@ -2,6 +2,7 @@ import React, {useEffect, useRef, useState} from 'react'
 import { subscribeLive } from '../services/liveTelemetry'
 import { captureFrame, analyzeFrame, checkAIEngineHealth } from '../services/aiEngineService'
 import LiveMap from '../components/LiveMap'
+import TripStatusBanner from '../components/TripStatusBanner'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:5000'
 
@@ -28,12 +29,21 @@ export default function LiveMonitoring(){
   const [position, setPosition] = useState(null)
   const [distanceKm, setDistanceKm] = useState(0)
   const [tripId, setTripId] = useState(null)
+  const [tripStartTimeIso, setTripStartTimeIso] = useState(null)
   const [aiEngineStatus, setAIEngineStatus] = useState(false)
   const [detections, setDetections] = useState([])
   const [cvMetrics, setCvMetrics] = useState(null)
   const [smoothedBBox, setSmoothedBBox] = useState(null)
   const [analysisError, setAnalysisError] = useState(null)
   const [driverEmotion, setDriverEmotion] = useState({ driver_emotion: 'unknown', confidence: 0, stress_level: 'LOW' })
+
+  const tripBannerTimeoutsRef = useRef({ labelTimeout: null, endedTimeout: null })
+  const prevTripIdRef = useRef(undefined)
+  const bannerTripIdRef = useRef(null)
+  const hasInitTripBannerRef = useRef(false)
+  const [tripBannerType, setTripBannerType] = useState('NO_ACTIVE')
+  const [tripStartAtMs, setTripStartAtMs] = useState(null)
+  const [tripTimerNowMs, setTripTimerNowMs] = useState(Date.now())
 
   const initAudio = async () => {
     try {
@@ -115,6 +125,46 @@ export default function LiveMonitoring(){
     }
   }
 
+  const clearTripBannerTimeouts = () => {
+    const { labelTimeout, endedTimeout } = tripBannerTimeoutsRef.current || {}
+    if (labelTimeout) clearTimeout(labelTimeout)
+    if (endedTimeout) clearTimeout(endedTimeout)
+    tripBannerTimeoutsRef.current = { labelTimeout: null, endedTimeout: null }
+  }
+
+  const parseIsoToMs = (iso) => {
+    if (!iso) return null
+    const t = Date.parse(String(iso))
+    return Number.isFinite(t) ? t : null
+  }
+
+  const showTripStartedBanner = (newTripId, startIso) => {
+    clearTripBannerTimeouts()
+    bannerTripIdRef.current = newTripId
+    const startAt = parseIsoToMs(startIso) ?? Date.now()
+    setTripStartAtMs(startAt)
+    setTripTimerNowMs(Date.now())
+    setTripBannerType('TRIP_STARTED')
+
+    tripBannerTimeoutsRef.current.labelTimeout = setTimeout(() => {
+      if (bannerTripIdRef.current !== newTripId) return
+      setTripBannerType(prev => (prev === 'TRIP_STARTED' ? 'TRIP_ACTIVE' : prev))
+    }, 5000)
+  }
+
+  const showTripEndedBanner = () => {
+    clearTripBannerTimeouts()
+    bannerTripIdRef.current = null
+    setTripStartAtMs(null)
+    setTripBannerType('TRIP_ENDED')
+
+    tripBannerTimeoutsRef.current.endedTimeout = setTimeout(() => {
+      // If a new trip started meanwhile, don't override it.
+      if (bannerTripIdRef.current) return
+      setTripBannerType('NO_ACTIVE')
+    }, 5000)
+  }
+
   // Smooth face bbox to reduce jitter
   useEffect(() => {
     const bbox = cvMetrics?.face_bbox
@@ -133,6 +183,61 @@ export default function LiveMonitoring(){
       }
     })
   }, [cvMetrics])
+
+  // Trip status banner: overwrite-safe state machine driven by tripId transitions.
+  useEffect(() => {
+    return () => clearTripBannerTimeouts()
+  }, [])
+
+  useEffect(() => {
+    const curr = tripId || null
+    const prev = prevTripIdRef.current
+
+    if (!hasInitTripBannerRef.current) {
+      hasInitTripBannerRef.current = true
+      prevTripIdRef.current = curr
+
+      if (curr) {
+        bannerTripIdRef.current = curr
+        const startAt = parseIsoToMs(tripStartTimeIso) ?? Date.now()
+        setTripStartAtMs(startAt)
+        setTripTimerNowMs(Date.now())
+        setTripBannerType('TRIP_ACTIVE')
+      } else {
+        bannerTripIdRef.current = null
+        setTripStartAtMs(null)
+        setTripBannerType('NO_ACTIVE')
+      }
+
+      return
+    }
+
+    // null -> id OR id -> different id: treat as trip started and overwrite immediately.
+    if ((!prev && curr) || (prev && curr && prev !== curr)) {
+      showTripStartedBanner(curr, tripStartTimeIso)
+    } else if (prev && !curr) {
+      // id -> null: trip ended
+      showTripEndedBanner()
+    } else if (!curr) {
+      // still no active trip
+      setTripBannerType(prevType => (prevType === 'TRIP_ENDED' ? prevType : 'NO_ACTIVE'))
+    } else {
+      // still active trip
+      bannerTripIdRef.current = curr
+      setTripBannerType(prevType => (prevType === 'NO_ACTIVE' ? 'TRIP_ACTIVE' : prevType))
+      setTripStartAtMs(prevStart => (prevStart == null ? (parseIsoToMs(tripStartTimeIso) ?? Date.now()) : prevStart))
+      setTripTimerNowMs(Date.now())
+    }
+
+    prevTripIdRef.current = curr
+  }, [tripId, tripStartTimeIso])
+
+  useEffect(() => {
+    const running = tripBannerType === 'TRIP_STARTED' || tripBannerType === 'TRIP_ACTIVE'
+    if (!running) return
+    const t = setInterval(() => setTripTimerNowMs(Date.now()), 1000)
+    return () => clearInterval(t)
+  }, [tripBannerType])
 
   useEffect(()=>{
     const unlockAudio = () => {
@@ -181,6 +286,7 @@ export default function LiveMonitoring(){
         const active = Boolean(data.trip_active)
         setState(active ? 'ACTIVE' : 'IDLE')
         setTripId(active ? (data.trip_id || null) : null)
+        setTripStartTimeIso(active ? (data.trip_start_time || null) : null)
 
         const loc = data.current_location
         if (loc && Number.isFinite(Number(loc.lat)) && Number.isFinite(Number(loc.lng))) {
@@ -360,8 +466,13 @@ export default function LiveMonitoring(){
     return () => clearInterval(interval)
   }, [aiEngineStatus, tripId, speed])
 
+  const tripElapsedSeconds = tripStartAtMs
+    ? Math.max(0, Math.floor((tripTimerNowMs - tripStartAtMs) / 1000))
+    : 0
+
   return (
     <div className="page live">
+      <TripStatusBanner type={tripBannerType} elapsedSeconds={tripElapsedSeconds} />
       {sos && <div className="emergency">EMERGENCY: SOS triggered</div>}
       {analysisError && (
         <div style={{background: '#ffa500', color: '#fff', padding: '8px', marginBottom: '8px', borderRadius: '4px'}}>
