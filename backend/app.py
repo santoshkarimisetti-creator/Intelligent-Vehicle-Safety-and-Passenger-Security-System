@@ -2,7 +2,7 @@ from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import uuid
 from math import radians, sin, cos, sqrt, atan2, log, tan, pi
@@ -61,73 +61,6 @@ trips_collection = db["trips"]
 events_collection = db["events"]  # For detections when no active trip
 
 IST_ZONE = ZoneInfo("Asia/Kolkata")
-
-AUTO_STOP_ACTIVE_TRIP_AFTER_HOURS = float(os.getenv("AUTO_STOP_ACTIVE_TRIP_AFTER_HOURS", "24"))
-AUTO_STOP_LABEL = os.getenv("AUTO_STOP_LABEL", "manually stopped after 24 hours")
-
-
-def _utcnow_naive() -> datetime:
-    return datetime.utcnow().replace(tzinfo=None)
-
-
-def _trip_start_utc_naive(trip: dict) -> datetime | None:
-    start_time = trip.get("start_time")
-    if isinstance(start_time, datetime):
-        dt = start_time
-        if dt.tzinfo is not None:
-            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
-        return dt
-    if isinstance(start_time, str):
-        return _parse_iso_to_utc_naive(start_time)
-    return None
-
-
-def _auto_stop_active_trips_over_24h() -> int:
-    """Mark ACTIVE trips older than 24 hours as completed.
-
-    This prevents a stuck ACTIVE trip from capturing all future AI events.
-    """
-    now = _utcnow_naive()
-    stopped = 0
-
-    try:
-        active_trips = list(
-            trips_collection.find(
-                {"status": "ACTIVE"},
-                {"_id": 1, "trip_id": 1, "start_time": 1, "end_time": 1, "status": 1},
-            )
-        )
-    except Exception:
-        return 0
-
-    for trip in active_trips:
-        start_dt = _trip_start_utc_naive(trip)
-        if not start_dt:
-            continue
-        age_h = (now - start_dt).total_seconds() / 3600.0
-        if age_h <= float(AUTO_STOP_ACTIVE_TRIP_AFTER_HOURS):
-            continue
-
-        try:
-            trips_collection.update_one(
-                {"_id": trip.get("_id"), "status": "ACTIVE"},
-                {
-                    "$set": {
-                        "status": "COMPLETED",
-                        "end_time": trip.get("end_time") or now.isoformat(),
-                        "stop_label": str(AUTO_STOP_LABEL),
-                        "stop_reason": "AUTO_STOP_24H",
-                        "stopped_by": "system",
-                        "stopped_at": now.isoformat(),
-                    }
-                },
-            )
-            stopped += 1
-        except Exception:
-            # Best-effort; don't break normal API responses.
-            pass
-
-    return stopped
 
 
 def to_ist_display(value):
@@ -394,6 +327,21 @@ def health_check():
 def create_trip():
     """Create a new trip with unique trip ID"""
     try:
+        now = datetime.utcnow()
+
+        # Event-driven trip control: ensure there is never more than one ACTIVE trip.
+        # If an ACTIVE trip exists, auto-complete it and immediately start a new one.
+        trips_collection.update_many(
+            {"status": "ACTIVE"},
+            {
+                "$set": {
+                    "status": "COMPLETED",
+                    "end_time": now,
+                    "end_reason": "auto_end_new_trip",
+                }
+            },
+        )
+
         # Generate unique trip ID
         trip_id = str(uuid.uuid4())
         
@@ -406,7 +354,7 @@ def create_trip():
         trip = {
             "trip_id": trip_id,
             "driver_id": driver_id,
-            "start_time": datetime.utcnow(),
+            "start_time": now,
             "status": "ACTIVE",
             "sensor_data": [],  # Initialize empty sensor data array
             "path": []  # Initialize empty path array for GPS points
@@ -414,6 +362,19 @@ def create_trip():
         
         # Insert into MongoDB
         result = trips_collection.insert_one(trip)
+
+        # Concurrency safety: if any other ACTIVE trips exist (e.g., parallel start requests),
+        # auto-complete them so this request finishes with exactly one ACTIVE trip.
+        trips_collection.update_many(
+            {"status": "ACTIVE", "trip_id": {"$ne": trip_id}},
+            {
+                "$set": {
+                    "status": "COMPLETED",
+                    "end_time": now,
+                    "end_reason": "auto_end_new_trip",
+                }
+            },
+        )
         
         return jsonify({
             "message": "Trip created successfully",
@@ -953,7 +914,6 @@ def download_trip_report_pdf(trip_id: str):
 def add_ai_result(trip_id):
     """Receive AI-engine detection/risk result and attach it to trip record."""
     try:
-        _auto_stop_active_trips_over_24h()
         trip = trips_collection.find_one({"trip_id": trip_id})
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
@@ -1521,11 +1481,103 @@ def get_trip_live_map(trip_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.get("/get-location/<trip_id>")
+def get_location(trip_id):
+    """Return the latest known coordinates for a trip.
+
+    Response shapes:
+    - OK: {"status":"OK","lat":<float>,"lon":<float>,"timestamp":<str|null>}
+    - NO_DATA: {"status":"NO_DATA","lat":null,"lon":null,"timestamp":null}
+    - NOT_FOUND: {"status":"NOT_FOUND","lat":null,"lon":null,"timestamp":null}
+
+    Never returns default/fake coordinates.
+    """
+
+    def _to_float(value):
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _timestamp_to_iso(value):
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        if isinstance(value, (int, float)):
+            try:
+                return (
+                    datetime.fromtimestamp(float(value), tz=timezone.utc)
+                    .isoformat()
+                    .replace("+00:00", "Z")
+                )
+            except Exception:
+                return None
+        if isinstance(value, str):
+            return value
+        return None
+
+    def _extract_from_path(path_points):
+        for point in reversed(path_points or []):
+            lat = _to_float(point.get("lat"))
+            lon = _to_float(point.get("lng"))
+            if lon is None:
+                lon = _to_float(point.get("lon"))
+            if lat is not None and lon is not None:
+                ts = (
+                    point.get("timestamp")
+                    or point.get("time")
+                    or point.get("ts")
+                    or point.get("t")
+                )
+                return lat, lon, _timestamp_to_iso(ts)
+        return None, None, None
+
+    def _extract_from_sensor_data(sensor_rows):
+        for row in reversed(sensor_rows or []):
+            lat = _to_float(row.get("latitude"))
+            lon = _to_float(row.get("longitude"))
+            if lon is None:
+                lon = _to_float(row.get("lng"))
+            if lon is None:
+                lon = _to_float(row.get("lon"))
+            if lat is None:
+                lat = _to_float(row.get("lat"))
+            if lat is not None and lon is not None:
+                ts = (
+                    row.get("timestamp")
+                    or row.get("time")
+                    or row.get("ts")
+                    or row.get("t")
+                )
+                return lat, lon, _timestamp_to_iso(ts)
+        return None, None, None
+
+    try:
+        trip = trips_collection.find_one({"trip_id": trip_id})
+        if not trip:
+            return jsonify({"status": "NOT_FOUND", "lat": None, "lon": None, "timestamp": None}), 404
+
+        lat, lon, ts = _extract_from_path(trip.get("path", []) or [])
+        if lat is None or lon is None:
+            lat, lon, ts = _extract_from_sensor_data(trip.get("sensor_data", []) or [])
+
+        if lat is None or lon is None:
+            return jsonify({"status": "NO_DATA", "lat": None, "lon": None, "timestamp": None}), 200
+
+        return jsonify({"status": "OK", "lat": lat, "lon": lon, "timestamp": ts}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.get("/is-active-trip/<trip_id>")
 def is_active_trip(trip_id):
     """Check if trip is currently active."""
     try:
-        _auto_stop_active_trips_over_24h()
         trip = trips_collection.find_one({"trip_id": trip_id})
         if not trip:
             return jsonify({"is_active": False, "message": "Trip not found"}), 200
