@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live Trip Tracking</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <style>
+    :root { --bg: #f6f8fb; --card: #ffffff; --text: #0f1724; --muted: #526070; --blue: #1565c0; }
+    * { box-sizing: border-box; font-family: Inter, Segoe UI, Arial, Helvetica, sans-serif; }
+    body { margin: 0; background: var(--bg); color: var(--text); }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 16px; }
+    .header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    h1 { font-size: 18px; margin: 0; }
+    .now { font-size: 12px; color: var(--muted); }
+    .card { margin-top: 12px; background: var(--card); border-radius: 10px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .status { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .badge { display: inline-block; background: var(--blue); color: #fff; padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .meta { color: var(--muted); font-size: 12px; }
+    .coords { margin-top: 10px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .coordBox { background: #f5f7fb; border-radius: 8px; padding: 10px; }
+    .coordLabel { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+    .coordValue { font-variant-numeric: tabular-nums; font-weight: 700; }
+    #map { margin-top: 10px; height: 420px; width: 100%; border-radius: 10px; overflow: hidden; }
+    .hidden { display: none; }
+    @media (max-width: 700px) {
+      .coords { grid-template-columns: 1fr; }
+      #map { height: 320px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>Live Trip Tracking</h1>
+      <div class="now" id="now"></div>
+    </div>
+
+    <div class="card">
+      <div class="status">
+        <div>
+          <span class="badge" id="tripStatus">No active trip</span>
+          <div class="meta" id="tripMeta">Waiting for backend…</div>
+        </div>
+        <div class="meta" style="text-align:right">
+          <div id="apiMeta"></div>
+          <div id="lastUpdated">Last updated: —</div>
+        </div>
+      </div>
+
+      <div id="activeSection" class="hidden">
+        <div class="coords">
+          <div class="coordBox">
+            <div class="coordLabel">Latitude</div>
+            <div class="coordValue" id="lat">—</div>
+          </div>
+          <div class="coordBox">
+            <div class="coordLabel">Longitude</div>
+            <div class="coordValue" id="lon">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div id="map"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const DEFAULT_API_BASE = 'http://localhost:5000'
+    const API_BASE = (location.origin && location.origin.startsWith('http')) ? location.origin : DEFAULT_API_BASE
+
+    const $ = (id) => document.getElementById(id)
+    const state = {
+      activeTripId: null,
+      lastLat: null,
+      lastLon: null,
+      lastPointAtMs: null,
+      mapInited: false,
+    }
+
+    let map = null
+    let marker = null
+    let markerAnimating = false
+    let animationCancelToken = 0
+
+    const carSvg = `<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <defs>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+  <g filter="url(#s)">
+    <path d="M14 36c0-8 6-16 18-16s18 8 18 16v10H14V36z" fill="#1565c0"/>
+    <path d="M22 26h20c3 0 6 3 6 6v4H16v-4c0-3 3-6 6-6z" fill="#1e7bd6"/>
+    <rect x="21" y="28" width="10" height="6" rx="2" fill="#e3f2fd"/>
+    <rect x="33" y="28" width="10" height="6" rx="2" fill="#e3f2fd"/>
+    <circle cx="22" cy="46" r="5" fill="#0f1724"/>
+    <circle cx="42" cy="46" r="5" fill="#0f1724"/>
+    <circle cx="22" cy="46" r="2" fill="#90a4ae"/>
+    <circle cx="42" cy="46" r="2" fill="#90a4ae"/>
+  </g>
+</svg>`
+
+    const carIcon = L.icon({
+      iconUrl: 'data:image/svg+xml;charset=UTF-8,' + encodeURIComponent(carSvg),
+      iconSize: [48, 48],
+      iconAnchor: [24, 24],
+    })
+
+    function setNow() {
+      $('now').textContent = new Date().toLocaleString()
+    }
+
+    function setLastUpdatedText() {
+      if (!state.lastPointAtMs) {
+        $('lastUpdated').textContent = 'Last updated: NO DATA'
+        return
+      }
+      const sec = Math.max(0, Math.floor((Date.now() - state.lastPointAtMs) / 1000))
+      let freshness = 'fresh'
+      if (sec >= 30) freshness = 'likely stopped'
+      else if (sec >= 10) freshness = 'stale'
+      $('lastUpdated').textContent = `Last updated: ${sec}s ago (${freshness})`
+    }
+
+    function setInactive() {
+      state.activeTripId = null
+      $('tripStatus').textContent = 'No active trip'
+      $('tripMeta').textContent = '—'
+      // Do NOT reset the last known location or marker.
+      // The last point should remain visible; no jumping.
+      if (state.lastLat != null && state.lastLon != null) {
+        $('activeSection').classList.remove('hidden')
+      } else {
+        $('activeSection').classList.add('hidden')
+      }
+    }
+
+    function setActive(tripId) {
+      state.activeTripId = tripId
+      $('tripStatus').textContent = 'Active trip'
+      $('tripMeta').textContent = `Trip ID: ${tripId}`
+      $('activeSection').classList.remove('hidden')
+    }
+
+    function coordsEqual(aLat, aLon, bLat, bLon) {
+      return Number(aLat) === Number(bLat) && Number(aLon) === Number(bLon)
+    }
+
+    function haversineMeters(lat1, lon1, lat2, lon2) {
+      const R = 6371000
+      const toRad = (d) => (Number(d) * Math.PI) / 180
+      const dLat = toRad(lat2 - lat1)
+      const dLon = toRad(lon2 - lon1)
+      const a =
+        Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+        Math.sin(dLon / 2) * Math.sin(dLon / 2)
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+      return R * c
+    }
+
+    function maybeRecenter(lat, lon, force = false) {
+      if (!map) return
+      const to = L.latLng(lat, lon)
+      if (force) {
+        map.setView(to, 16, { animate: true })
+        return
+      }
+
+      // Only recenter if the marker drifts significantly outside view.
+      const bounds = map.getBounds()
+      if (!bounds || bounds.contains(to)) return
+      map.panTo(to, { animate: true, duration: 0.8 })
+    }
+
+    function setCoordsUI(lat, lon) {
+      $('lat').textContent = String(lat)
+      $('lon').textContent = String(lon)
+    }
+
+    function animateMarker(fromLat, fromLon, toLat, toLon, durationMs = 1200) {
+      if (!marker || !map) return
+      markerAnimating = true
+      const myToken = ++animationCancelToken
+
+      const start = performance.now()
+      const easeInOut = (t) => (t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2)
+
+      const step = (now) => {
+        if (myToken !== animationCancelToken) return
+        const t = Math.min(1, (now - start) / durationMs)
+        const e = easeInOut(t)
+        const lat = fromLat + (toLat - fromLat) * e
+        const lon = fromLon + (toLon - fromLon) * e
+        marker.setLatLng([lat, lon])
+        if (t < 1) {
+          requestAnimationFrame(step)
+        } else {
+          markerAnimating = false
+        }
+      }
+
+      requestAnimationFrame(step)
+    }
+
+    function applyNewPoint(lat, lon) {
+      const prevLat = state.lastLat
+      const prevLon = state.lastLon
+
+      // First point: place marker once and center once.
+      if (prevLat == null || prevLon == null || !marker) {
+        state.lastLat = lat
+        state.lastLon = lon
+        state.lastPointAtMs = Date.now()
+        setCoordsUI(lat, lon)
+
+        marker = L.marker([lat, lon], { icon: carIcon })
+        marker.addTo(map)
+        maybeRecenter(lat, lon, true)
+        return
+      }
+
+      // Event-based behavior: if identical point, do NOTHING.
+      if (coordsEqual(prevLat, prevLon, lat, lon)) {
+        return
+      }
+
+      // New DB point -> smoothly animate to it.
+      const moveMeters = haversineMeters(prevLat, prevLon, lat, lon)
+      state.lastLat = lat
+      state.lastLon = lon
+      state.lastPointAtMs = Date.now()
+      setCoordsUI(lat, lon)
+
+      // Cancel any prior animation and animate toward the new point.
+      animationCancelToken++
+      animateMarker(Number(prevLat), Number(prevLon), Number(lat), Number(lon), 1200)
+
+      // Recenter only when movement is large.
+      if (moveMeters >= 400) {
+        maybeRecenter(lat, lon, false)
+      }
+    }
+
+    async function fetchJson(url) {
+      const res = await fetch(url, { cache: 'no-store' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      return res.json()
+    }
+
+    function initLeafletMapOnce() {
+      if (state.mapInited) return
+      state.mapInited = true
+      map = L.map('map', {
+        zoomControl: true,
+      })
+
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; OpenStreetMap contributors',
+      }).addTo(map)
+
+      // No default coordinates: show the world until first real point arrives.
+      map.fitWorld({ animate: false })
+    }
+
+    async function tick() {
+      $('apiMeta').textContent = `API: ${API_BASE}`
+      try {
+        initLeafletMapOnce()
+        const urlTripId = new URLSearchParams(location.search).get('trip_id')
+        const tripId = urlTripId || (await (async () => {
+          const live = await fetchJson(`${API_BASE}/trips/active-trip/live_map`)
+          const active = Boolean(live.trip_active)
+          if (!active) return null
+          return live.trip_id || null
+        })())
+
+        if (!tripId) {
+          setInactive()
+          return
+        }
+
+        setActive(tripId)
+
+        const loc = await fetchJson(`${API_BASE}/get-location/${encodeURIComponent(tripId)}`)
+        if (loc && String(loc.status || '').toUpperCase() === 'NO_DATA') {
+          // Never inject fake coordinates. Keep last known position if any.
+          $('tripMeta').textContent = `Trip ID: ${tripId} (NO DATA)`
+          return
+        }
+
+        const lat = Number(loc?.lat)
+        const lon = Number(loc?.lon)
+
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+          $('tripMeta').textContent = `Trip ID: ${tripId} (NO DATA)`
+          return
+        }
+
+        // Movement only on new data.
+        applyNewPoint(lat, lon)
+      } catch (e) {
+        // On error: don't reset marker or last known position.
+        $('tripStatus').textContent = state.activeTripId ? 'Active trip' : 'No active trip'
+        $('tripMeta').textContent = `Error: ${e?.message || 'failed to fetch'}`
+        // keep lastFetchAtMs unchanged on error
+      }
+    }
+
+    setNow()
+    setInterval(setNow, 1000)
+
+    setInterval(setLastUpdatedText, 1000)
+
+    tick()
+    setInterval(tick, 5000)
+  </script>
+</body>
+</html>

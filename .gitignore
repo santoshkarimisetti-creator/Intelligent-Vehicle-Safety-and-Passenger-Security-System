@@ -1,8 +1,12 @@
 # ===== Python / Backend / AI Engine =====
+backend/.env
+backend/.env.*
 backend/.venv/
 backend/__pycache__/
 backend/*.log
 backend/server.log
+ai_engine/.env
+ai_engine/.env.*
 ai_engine/.venv/
 ai_engine/__pycache__/
 ai_engine/*.log

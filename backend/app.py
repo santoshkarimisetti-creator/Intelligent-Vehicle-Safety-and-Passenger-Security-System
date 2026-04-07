@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, render_template
 from flask_cors import CORS
 from pymongo import MongoClient
 from bson.objectid import ObjectId
@@ -13,6 +13,11 @@ import os
 import io
 import csv
 import urllib.request
+import traceback
+
+from dotenv import load_dotenv
+
+load_dotenv()
 from calibration_model import (
     get_driver_calibration,
     create_driver_calibration,
@@ -51,6 +56,9 @@ def _get_lan_ipv4_addresses() -> list[str]:
 app = Flask(__name__)
 CORS(app)
 
+SERVER_BOOT_ID = str(uuid.uuid4())
+SERVER_BOOT_AT = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+
 # MongoDB Connection
 MONGO_URI = "mongodb://localhost:27017/"
 client = MongoClient(MONGO_URI)
@@ -61,6 +69,169 @@ trips_collection = db["trips"]
 events_collection = db["events"]  # For detections when no active trip
 
 IST_ZONE = ZoneInfo("Asia/Kolkata")
+
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip()
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "").strip()
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886").strip()
+TWILIO_WHATSAPP_TO = os.getenv("TWILIO_WHATSAPP_TO", "").strip()
+
+print("TWILIO_ACCOUNT_SID:", TWILIO_ACCOUNT_SID)
+print("TWILIO_WHATSAPP_TO:", TWILIO_WHATSAPP_TO)
+
+
+def _clean_str(value):
+    if value is None:
+        return None
+    try:
+        s = str(value).strip()
+    except Exception:
+        return None
+    if not s:
+        return None
+    if s.lower() in {"null", "none", "undefined"}:
+        return None
+    return s
+
+
+_DRIVER_SESSION_LOCK = threading.Lock()
+_DRIVER_SESSION = {
+    "boot_id": SERVER_BOOT_ID,
+    "driver_id": None,
+    "driver_name": None,
+    "vehicle_no": None,
+    "license_no": None,
+    "updated_at": None,
+}
+
+
+def _get_driver_session_snapshot():
+    with _DRIVER_SESSION_LOCK:
+        return dict(_DRIVER_SESSION)
+
+
+def _set_driver_session(details: dict):
+    with _DRIVER_SESSION_LOCK:
+        _DRIVER_SESSION.update(details)
+
+
+@app.post("/driver-session")
+def set_driver_session():
+    """Store driver details for the current backend boot/session.
+
+    This is used as a fallback when clients start trips without providing
+    driver_name/vehicle_no/license_no (or they arrive as null).
+    """
+    payload = request.get_json(silent=True) or {}
+
+    driver_name = _clean_str(payload.get("driver_name"))
+    vehicle_no = _clean_str(payload.get("vehicle_no"))
+    license_no = _clean_str(payload.get("license_no"))
+    driver_id = _clean_str(payload.get("driver_id")) or license_no
+
+    if not driver_name or not vehicle_no or not license_no:
+        return jsonify({"error": "driver_name, vehicle_no, license_no are required"}), 400
+
+    _set_driver_session(
+        {
+            "boot_id": SERVER_BOOT_ID,
+            "driver_id": driver_id,
+            "driver_name": driver_name,
+            "vehicle_no": vehicle_no,
+            "license_no": license_no,
+            "updated_at": datetime.utcnow(),
+        }
+    )
+
+    # If a trip is already ACTIVE (e.g., started by another client), ensure its
+    # driver metadata is not left as null.
+    try:
+        result = trips_collection.update_many(
+            {
+                "status": "ACTIVE",
+                "$or": [
+                    {"driver_name": {"$exists": False}},
+                    {"driver_name": None},
+                    {"vehicle_no": {"$exists": False}},
+                    {"vehicle_no": None},
+                    {"license_no": {"$exists": False}},
+                    {"license_no": None},
+                ],
+            },
+            {
+                "$set": {
+                    "driver_id": driver_id,
+                    "driver_name": driver_name,
+                    "vehicle_no": vehicle_no,
+                    "license_no": license_no,
+                }
+            },
+        )
+        updated = int(getattr(result, "modified_count", 0) or 0)
+    except Exception:
+        updated = 0
+
+    return jsonify({"status": "ok", "boot_id": SERVER_BOOT_ID, "updated_active_trips": updated}), 200
+
+
+def send_sos_alert(trip: dict):
+    """Send a minimal SOS alert with maps + tracking links via Twilio WhatsApp."""
+    try:
+        from twilio.rest import Client
+    except Exception:
+        raise RuntimeError("twilio package not installed")
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        raise RuntimeError("Missing TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN")
+    if not TWILIO_WHATSAPP_TO:
+        raise RuntimeError("Missing TWILIO_WHATSAPP_TO")
+
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+    trip_oid = str(trip.get("_id"))
+    base_url = (PUBLIC_BASE_URL or "https://drew-onrushing-loverly.ngrok-free.dev").rstrip("/")
+    tracking_link = f"{base_url}/tracking?trip_id={trip_oid}"
+
+    last_lat = trip.get("last_lat")
+    last_lng = trip.get("last_lng")
+    if last_lat is not None and last_lng is not None:
+        maps_link = f"https://www.google.com/maps?q={last_lat},{last_lng}"
+    else:
+        maps_link = "Location not available"
+
+    driver_name = trip.get("driver_name") or "Unknown"
+    vehicle_number = trip.get("vehicle_number") or trip.get("vehicle_no") or "Unknown"
+
+    message = f"""
+🚨 SOS ALERT 🚨
+
+Driver: {driver_name}
+Vehicle: {vehicle_number}
+
+📍 Location:
+{maps_link}
+
+📡 Live Tracking:
+{tracking_link}
+""".strip()
+
+    print("==== DEBUG SOS ====")
+    print("TO:", TWILIO_WHATSAPP_TO)
+    print("FROM:", TWILIO_WHATSAPP_FROM)
+    print("SID:", (TWILIO_ACCOUNT_SID[:10] + " ...") if TWILIO_ACCOUNT_SID else "")
+    print("BASE_URL:", base_url)
+    print("===================")
+
+    try:
+        msg = client.messages.create(
+            body=message,
+            from_=TWILIO_WHATSAPP_FROM,
+            to=TWILIO_WHATSAPP_TO,
+        )
+        print("✅ SOS sent:", msg.sid)
+    except Exception:
+        print("🔥 FULL TWILIO ERROR BELOW 🔥")
+        traceback.print_exc()
+        raise
 
 
 def to_ist_display(value):
@@ -320,7 +491,14 @@ def compute_emotion_trip_summary(trip: dict, *, trip_end_time: datetime | None =
 
 @app.get("/")
 def health_check():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "boot_id": SERVER_BOOT_ID, "boot_at": SERVER_BOOT_AT})
+
+
+@app.get("/tracking")
+def tracking_page():
+    return render_template("tracking.html")
+
+
 
 
 @app.post("/trips")
@@ -345,15 +523,28 @@ def create_trip():
         # Generate unique trip ID
         trip_id = str(uuid.uuid4())
         
-        # Get driver ID from request
-        driver_id = request.json.get("driver_id")
+        payload = request.get_json(silent=True) or {}
+
+        # Fallback: if clients start trips without driver fields (or they arrive as null),
+        # reuse the most recently stored driver-session details.
+        session = _get_driver_session_snapshot()
+
+        # Driver identity
+        driver_id = _clean_str(payload.get("driver_id")) or _clean_str(payload.get("license_no")) or _clean_str(session.get("driver_id"))
         if not driver_id:
             return jsonify({"error": "driver_id is required"}), 400
+
+        driver_name = _clean_str(payload.get("driver_name")) or _clean_str(session.get("driver_name")) or "Unknown"
+        vehicle_no = _clean_str(payload.get("vehicle_no")) or _clean_str(session.get("vehicle_no")) or "Unknown"
+        license_no = _clean_str(payload.get("license_no")) or _clean_str(session.get("license_no")) or driver_id
         
         # Create trip document
         trip = {
             "trip_id": trip_id,
             "driver_id": driver_id,
+            "driver_name": driver_name,
+            "vehicle_no": vehicle_no,
+            "license_no": license_no,
             "start_time": now,
             "status": "ACTIVE",
             "sensor_data": [],  # Initialize empty sensor data array
@@ -1110,6 +1301,9 @@ def add_sos_event(trip_id):
         trips_collection.update_one({"trip_id": trip_id}, update_doc)
         events_collection.insert_one(emergency_event)
 
+        # After updating DB, send WhatsApp SOS alert
+        send_sos_alert(trip)
+
         return jsonify({
             "message": "SOS event recorded",
             "trip_id": trip_id,
@@ -1177,8 +1371,16 @@ def add_sensor_data(trip_id):
 def add_location(trip_id):
     """Add a GPS location point to trip path"""
     try:
-        # Find the trip
+        # Find the trip (accept either trip_id or Mongo _id)
         trip = trips_collection.find_one({"trip_id": trip_id})
+        trip_query = {"trip_id": trip_id}
+        if not trip:
+            try:
+                oid = ObjectId(trip_id)
+                trip = trips_collection.find_one({"_id": oid})
+                trip_query = {"_id": oid}
+            except Exception:
+                trip = None
         if not trip:
             return jsonify({"error": "Trip not found"}), 404
         
@@ -1206,10 +1408,14 @@ def add_location(trip_id):
         
         # Append location to path array using $push (append, never overwrite)
         result = trips_collection.update_one(
-            {"trip_id": trip_id},
+            trip_query,
             {
                 "$push": {"path": location_point},
-                "$set": {"last_update": datetime.utcnow()}
+                "$set": {
+                    "last_update": datetime.utcnow(),
+                    "last_lat": location_data["latitude"],
+                    "last_lng": location_data["longitude"],
+                }
             }
         )
         
@@ -1560,6 +1766,11 @@ def get_location(trip_id):
     try:
         trip = trips_collection.find_one({"trip_id": trip_id})
         if not trip:
+            try:
+                trip = trips_collection.find_one({"_id": ObjectId(trip_id)})
+            except Exception:
+                trip = None
+        if not trip:
             return jsonify({"status": "NOT_FOUND", "lat": None, "lon": None, "timestamp": None}), 404
 
         lat, lon, ts = _extract_from_path(trip.get("path", []) or [])
@@ -1570,6 +1781,27 @@ def get_location(trip_id):
             return jsonify({"status": "NO_DATA", "lat": None, "lon": None, "timestamp": None}), 200
 
         return jsonify({"status": "OK", "lat": lat, "lon": lon, "timestamp": ts}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.post("/sos/<trip_id>")
+def sos(trip_id):
+    """Send SOS alert for a trip (accepts Mongo _id hex or trip_id)."""
+    try:
+        trip = None
+        try:
+            trip = trips_collection.find_one({"_id": ObjectId(trip_id)})
+        except Exception:
+            trip = None
+        if not trip:
+            trip = trips_collection.find_one({"trip_id": trip_id})
+
+        if not trip:
+            return jsonify({"error": "Trip not found"}), 404
+
+        send_sos_alert(trip)
+        return jsonify({"status": "SOS sent"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
