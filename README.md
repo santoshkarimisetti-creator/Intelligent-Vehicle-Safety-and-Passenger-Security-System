@@ -1,12 +1,29 @@
 # Intelligent Vehicle Safety and Passenger Security System (IVS)
 
+⚠️ **PROTOTYPE / NOT PRODUCTION-READY** ⚠️
+
+This system is a **demonstration and research prototype** designed for local execution and testing. It is not hardened for production deployment. Do not rely on this system for real safety-critical applications without extensive validation, additional error handling, user authentication, and compliance review.
+
+---
+
 End-to-end safety monitoring system that combines:
 
 - **Backend (Flask + MongoDB)**: trip lifecycle, telemetry ingestion, persistence, exports, SOS messaging, calibration storage.
-- **AI Engine (Flask)**: camera-frame analysis (MediaPipe FaceLandmarker + temporal behavior engine), identity verification, emotion inference (ONNX), passenger SOS gesture, risk scoring, and asynchronous persistence back to backend.
+- **AI Engine (Flask)**: camera-frame analysis (MediaPipe FaceLandmarker + temporal behavior engine), best-effort identity embedding matching, emotion inference (ONNX), passenger SOS gesture, rule-based risk estimation, and asynchronous persistence back to backend.
 - **Frontend (React + Vite)**: live monitoring dashboard with webcam, live map, trips, trip replay, background events, SOS feed.
 
-This README is written to match what is **actually implemented in this repository** (endpoints, fields, thresholds, intervals, and defaults).
+This README documents what is **actually implemented in this repository** (endpoints, fields, thresholds, intervals, and defaults). Performance and robustness vary significantly based on camera quality, lighting, face visibility, and the presence of occlusions or multiple people.
+
+---
+
+## How to understand this document
+
+This document is intentionally detailed and not meant to be read end-to-end. Navigate directly to relevant sections based on your goal (setup, understanding behavior, or extending the system).
+
+- **Running the system?** → See [Setup and run](#setup-and-run).
+- **Deploying or extending code?** → Read [Component details](#component-details) and [API reference](#api-reference).
+- **Understanding detection behavior?** → See [Behavior detection and temporal rules](#behavior-detection-and-temporal-rules) and [Risk scoring](#risk-scoring).
+- **Known issues and gaps?** → Review [Known limitations / mismatches](#known-limitations--mismatches) carefully before deployment.
 
 ---
 
@@ -43,10 +60,42 @@ High-level folders:
 ai_engine/                # AI service (Flask) - CV + temporal detection + risk + emotion + persistence
 backend/                  # Backend API (Flask) - trips, telemetry, events, SOS, exports, calibration
 frontend/                 # React + Vite dashboard
-android/PassengerApp/     # Android project (present in repo; integration not documented in code here)
-docs/                     # Architecture + explanatory docs (may be more conceptual than code)
+android/PassengerApp/     # Android passenger app (integrated for SOS broadcasts and event reporting)
+docs/                     # Conceptual architecture docs (may not reflect exact runtime behavior; use code as source of truth)
 tools/                    # Helper scripts (Mongo checks, manual insert, etc.)
 ```
+
+### Android Passenger App
+
+The Android PassengerApp acts as a passenger-side control and safety interface.
+
+Core functionality:
+
+- **Start Trip**
+  - Triggers backend `POST /trips`
+  - Initializes a new trip session
+
+- **Stop Trip**
+  - Calls backend `PUT /trips/<trip_id>/end`
+  - Ends the active trip and finalizes trip summary
+
+- **SOS Trigger**
+  - Calls backend `POST /sos/<trip_id>`
+  - Immediately flags emergency and triggers alert pipeline
+
+- **Live Location Streaming**
+  - Sends GPS coordinates to backend every **5 seconds**
+  - Endpoint: `POST /trips/<trip_id>/location`
+  - Used for:
+    - Real-time tracking
+    - Trip path reconstruction
+    - Location sharing during SOS events
+
+Notes:
+
+- App is designed for **passenger use**, not driver interaction
+- Relies on backend availability and network connectivity
+- Location accuracy depends on device GPS and permissions
 
 ---
 
@@ -54,10 +103,15 @@ tools/                    # Helper scripts (Mongo checks, manual insert, etc.)
 
 ### Runtime components and default ports
 
+All components default to **localhost** and are designed for **local testing and demonstration only**:
+
 - **Backend API**: `http://localhost:5000`
 - **AI Engine**: `http://localhost:5001`
 - **Frontend (Vite dev server)**: typically `http://localhost:5173` (Vite default; may vary)
 - **MongoDB**: `mongodb://localhost:27017/` (backend uses a fixed URI; AI engine supports env override)
+- **Android App**: connects to backend API (via `VITE_API_BASE` type configuration)
+
+This system follows a hybrid approach combining computer vision, rule-based temporal logic, and lightweight ML (emotion inference) for explainability and real-time performance.
 
 ### End-to-end flow (what happens at runtime)
 
@@ -107,7 +161,16 @@ tools/                    # Helper scripts (Mongo checks, manual insert, etc.)
   - driver_not_visible (identity visibility model)
   - camera-blocked and occlusion-related warnings (mouth occluded, too far)
 
+**Performance expectations:**
+- Detection is **rule-based and heuristic-heavy**; observed to perform consistently under tested conditions (good lighting, single face, normal driving posture).
+- Robustness degrades significantly with poor lighting, occlusions, multiple faces, extreme head poses, or camera obstruction.
+- No quantified accuracy metrics; tuning is manual and environment-dependent.
+- False positives and false negatives are expected; this system is intended for **alerting only**, not enforcement.
+- In informal testing, the system was observed to function under low-light conditions (e.g., laptop-only illumination) and with multiple faces present; however, these observations are scenario-specific and not formally benchmarked.
+
 ### Identity + personalization (AI)
+
+**Note:** *No authentication or authorization is implemented.* Identity verification is best-effort via embeddings and user-provided identifiers only.
 
 - Uses OpenCV Zoo **YuNet + SFace** to extract embeddings.
 - Stores driver embeddings in MongoDB `drivers` (preferred) or `ai_engine/driver_embeddings.json` fallback.
@@ -121,11 +184,18 @@ tools/                    # Helper scripts (Mongo checks, manual insert, etc.)
   - crop driver face
   - resize to model input (default 64x64)
   - grayscale
-  - float32 **without normalization** (keeps 0–255)
+  - float32 **without normalization** (keeps 0–255); model was trained on unnormalized grayscale inputs
   - shape `[1, 1, H, W]`
-- Runs periodically (interval design is 5 seconds in code).
+- Runs periodically (interval design is 5 seconds in code) in the slow analytics loop.
 - Maintains a small smoothing buffer (last-3) and produces:
   - `dominant_emotion`, `confidence`, `stress_level`, `emotion_risk_score`
+
+**Limitations:** 
+- Emotion inference is sensitive to lighting, face angle, and model bias.
+- No validation against real emotional labels; classification is heuristic.
+- Confidence thresholds should be tuned for your environment and lighting conditions.
+- Performance has not been quantified and may vary significantly across populations and driving contexts.
+- Emotion output is used as a supporting signal in final risk fusion and does not independently trigger critical decisions.
 
 ### Passenger SOS gesture (AI)
 
@@ -504,7 +574,6 @@ Core trip document fields (not exhaustive; includes the fields actively read/wri
   "path": [
     {
       "lat": 0.0,
-      "lon": 0.0,
       "lng": 0.0,
       "timestamp": "...",
       "risk": 0
@@ -563,12 +632,14 @@ Core trip document fields (not exhaustive; includes the fields actively read/wri
 
 ### `events` collection (background detections + emergency feed)
 
+**Data consistency note:** Older documents may have mixed timestamp formats (ISO string, Python datetime object, or plain string). New documents use consistent ISO 8601 format.
+
 ```json
 {
   "_id": "ObjectId",
   "event_id": "uuid",
   "trip_id": "uuid|null",
-  "timestamp": "ISO|string|datetime (older docs may vary)",
+  "timestamp": "ISO 8601 string",
   "received_at": "datetime",
   "start_time": "ISO",
   "end_time": "ISO|null",
@@ -701,6 +772,14 @@ The engine can warn about:
 
 Risk scoring is implemented in `ai_engine/risk_engine.py`.
 
+⚠️ **CRITICAL DISCLAIMER:** 
+- Risk scores are **heuristic-based and rule-driven**, not trained on crash/incident datasets.
+- Weights and escalation rules are **manually tuned** and have **no validation** against real-world data.
+- **No quantified accuracy or sensitivity metrics exist**; classification is arbitrary.
+- This system is suitable for **demonstration and alerting only**, not for safety-critical decisions.
+- Do not rely on risk scores for automated enforcement, litigation, or safety claims without independent validation.
+- Risk scores are not standardized and are not directly comparable across different drivers, trips, or environments.
+
 ### Inputs
 
 - `detections[]` (types like drowsiness/yawning/distraction/driver_not_visible)
@@ -729,6 +808,8 @@ base_score = 45*eyes_closed_score + 30*head_off_road_score + 15*yawning_score + 
 speed_norm = min(speed, speed_norm_cap_kmh) / speed_norm_cap_kmh
 ```
 
+The coefficients are manually tuned heuristics and have not been validated against real crash data.
+
 Escalation rules:
 
 - Drowsiness: +10 (>=2), +20 (>=3)
@@ -747,12 +828,14 @@ Temporal label buckets:
 
 ### Weighted risk score
 
-Default weights:
+Default weights (manually tuned heuristics; no validation dataset or justification):
 
 - overspeed: 0.25
 - drowsiness: 0.30
 - distraction: 0.35
 - yawning: 0.10
+
+**These weights are arbitrary and not based on statistical analysis or crash data.**
 
 Weighted label buckets:
 
@@ -814,7 +897,19 @@ When backend receives `POST /trips/<trip_id>/sos`:
 
 If Twilio env vars are configured, backend will send a WhatsApp SOS message.
 
-- It uses `PUBLIC_BASE_URL` (if set) to build a tracking link for the trip.
+**⚠️ Important:** Twilio WhatsApp integration requires:
+- A **publicly routable URL** (not `localhost`, not `127.0.0.1`)
+- Use **ngrok** or a similar tunneling service to expose the local backend during development:
+  ```bash
+  ngrok http 5000
+  ```
+- Set `PUBLIC_BASE_URL` to the ngrok URL (e.g., `https://abc123.ngrok.io`)
+- **Localhost SOS messages will fail silently** because Twilio cannot reach `localhost` to verify or send the callback.
+- For production, use a real public server domain.
+
+Payload:
+
+- Builds a tracking link from `PUBLIC_BASE_URL` for the trip
 
 ---
 
@@ -829,7 +924,7 @@ If Twilio env vars are configured, backend will send a WhatsApp SOS message.
 
 Loaded via `python-dotenv` (`load_dotenv()`), so you can use a `.env` file.
 
-- `PUBLIC_BASE_URL` (optional; used to build links in SOS messages)
+- `PUBLIC_BASE_URL` (**required for SOS to work**; must be a public URL, not `localhost`; use ngrok during development)
 - `TWILIO_ACCOUNT_SID`
 - `TWILIO_AUTH_TOKEN`
 - `TWILIO_WHATSAPP_FROM` (default `whatsapp:+14155238886`)
@@ -976,7 +1071,13 @@ Behavior engine tunables (quality + detection tuning):
 
 Make sure MongoDB is running and listening on `mongodb://localhost:27017/`.
 
-The backend currently connects to MongoDB using a fixed URI in code.
+### Backend MongoDB URI limitation
+
+The backend MongoDB URI is **not configurable** via environment variables and is hardcoded to `mongodb://localhost:27017/` in `backend/app.py`. 
+
+**Impact:**
+- Remote deployment requires code modification or a local MongoDB proxy.
+- The system is tightly coupled to localhost MongoDB and is not suitable for deployment to cloud/remote servers without changes.
 
 ### 2) Backend setup (port 5000)
 
@@ -998,16 +1099,20 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Optional `.env` (in `backend/`):
+Required/recommended `.env` (in `backend/`):
 
 ```env
-PUBLIC_BASE_URL=https://<your-ngrok-or-public-host>
+# Required for SOS WhatsApp to work (use ngrok during development):
+PUBLIC_BASE_URL=https://abc123.ngrok.io
 
-TWILIO_ACCOUNT_SID=...
-TWILIO_AUTH_TOKEN=...
+# Twilio configuration (required if SOS is enabled):
+TWILIO_ACCOUNT_SID=ACxxxxxx
+TWILIO_AUTH_TOKEN=auth_token_here
 TWILIO_WHATSAPP_FROM=whatsapp:+14155238886
-TWILIO_WHATSAPP_TO=whatsapp:+<your-number>
+TWILIO_WHATSAPP_TO=whatsapp:+<recipient-number>
 ```
+
+Without these, SOS messages will not send.
 
 Run:
 
@@ -1156,7 +1261,7 @@ Response shape:
   "trip_id": "...",
   "trip_start_time": "2026-01-01T00:00:00Z",
   "current_location": {"lat": 12.34, "lng": 56.78},
-  "path": [ {"lat": 12.34, "lon": 56.78, "timestamp": "..."} ]
+  "path": [ {"lat": 12.34, "lng": 56.78, "timestamp": "..."} ]
 }
 ```
 
@@ -1332,7 +1437,7 @@ Folder: `tools/`
 
 ## Known limitations / mismatches
 
-These items are based on current code state:
+This is a **prototype system** with significant limitations for real-world deployment:
 
 1. **Backend Mongo URI is hardcoded** (`mongodb://localhost:27017/`) in `backend/app.py`.
 2. **Frontend calibration page calls non-existent endpoints on backend**:
@@ -1343,6 +1448,14 @@ These items are based on current code state:
    - LiveMonitoring uses `subscribeLive()` from `frontend/src/services/liveTelemetry.js`, which generates randomized speed/state.
    - Map position is *not* synthetic (it polls backend live_map). If the backend has no GPS points, the map shows “No location coordinates available”.
 4. Docs under `docs/` may describe conceptual flows that do not exactly match current implementation defaults.
+
+5. **No quantified accuracy, precision/recall, or false-positive/false-negative metrics are available.**
+
+6. **No dataset-based training or evaluation has been performed for detection or risk scoring.**
+
+7. **System performance has not been validated across diverse users (lighting conditions, skin tones, accessories such as glasses or masks).**
+
+8. **Driver tracking is designed for a primary face; while tested with multiple faces, stability may degrade with overlapping faces, frequent entry/exit, or similar appearances.**
 
 ---
 
@@ -1372,3 +1485,14 @@ These items are based on current code state:
 
 - Camera requires HTTPS in some contexts; localhost is typically allowed.
 - Audio beeps require a user interaction; LiveMonitoring adds listeners for pointerdown/keydown to unlock audio.
+
+### SOS WhatsApp not sending (Localhost issue)
+
+- **Problem:** Requests may succeed locally, but callbacks fail because Twilio cannot reach localhost endpoints, resulting in no message delivery.
+- **Root cause:** Twilio cannot route callbacks to `127.0.0.1`; requires a public URL.
+- **Solution:** Use ngrok:
+  ```bash
+  ngrok http 5000
+  ```
+  Then set `PUBLIC_BASE_URL=https://abc123.ngrok.io` in backend `.env`.
+
